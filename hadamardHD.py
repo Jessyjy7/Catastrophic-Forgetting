@@ -37,24 +37,39 @@ random_hvs = generate_random_hvs(n_hvs, hv_length, 10)
 for i, hv in enumerate(random_hvs):
     print(f"Original A_{i}: {hv}")
 
-HV_0 = np.zeros(hv_length)
-for i in range(n_hvs):
+def binding (hv_length, i, random_hvs):
+    binded_HV = np.zeros(hv_length)
     key_vector = kronecker_hadamard(hv_length, i)
     print(f"Key K_{i}: {key_vector}")
-    # key_vector = keys[i]
-    HV_0 += key_vector * random_hvs[i]
+    binded_HV = key_vector * random_hvs[i]
+    print(f"\nBinded HV: {binded_HV}\n")
+    return binded_HV
 
-print(f"\nEncoded HV_0: {HV_0}\n")
+def bundling (hv_length, n_hvs, random_hvs):
+    bundled_HV = np.zeros(hv_length)
+    for i in range(n_hvs):
+        bundled_HV += binding (hv_length, i, random_hvs)
+    print(f"\nBundled HV: {bundled_HV}\n")
+    return bundled_HV
 
-decoded_hvs = []
-for i in range(n_hvs):
-    # key = keys[i]
-    # key_inverse = np.reciprocal(key)
+def unbinding (hv_length, n_hvs, random_hvs):
+    unbinded_hvs = []
     key_vector = kronecker_hadamard(hv_length, i)
     key_inverse = np.reciprocal(key_vector)
     projection = HV_0 * key_inverse
-    decoded_hvs.append(projection)
+    unbinded_hvs.append(projection)
     print(f"Decoded vector for A_{i}: {projection}")
+        
+def unbundling ():
+    unbundled_hvs = []
+    for i in range(n_hvs):
+        # key = keys[i]
+        # key_inverse = np.reciprocal(key)
+        key_vector = kronecker_hadamard(hv_length, i)
+        key_inverse = np.reciprocal(key_vector)
+        projection = HV_0 * key_inverse
+        decoded_hvs.append(projection)
+        print(f"Decoded vector for A_{i}: {projection}")
 	
 for i in range(n_hvs):
     original_hv = random_hvs[i]

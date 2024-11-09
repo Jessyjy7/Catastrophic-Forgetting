@@ -1,5 +1,6 @@
 import numpy as np
 import argparse as ap
+import pickle
 import matplotlib.pyplot as plt
 from hadamardHD import kronecker_hadamard, binding, unbinding, bundling, calculate_similarity
 from PYTORCHCNNS.model_zoo.datasets.digit_loader import get_digit_loader
@@ -7,7 +8,7 @@ from PYTORCHCNNS.model_zoo.datasets.digit_loader import get_digit_loader
 # Setup arguments
 parser = ap.ArgumentParser()
 parser.add_argument('-dataset', type=str, default="mnist", help="Dataset name")
-parser.add_argument('-n', type=int, default=2, help="Number of encoded samples to bundle per digit")
+parser.add_argument('-n', type=int, default=5, help="Number of encoded samples to bundle per digit")
 args = parser.parse_args()
 
 # Step 1: Load data and encode as before
@@ -99,4 +100,9 @@ def plot_original_and_decoded_grouped(digit_samples, decoded_digit_samples, n):
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # Adjust layout to avoid overlap
     plt.show()
     
-plot_original_and_decoded_grouped(digit_samples, decoded_digit_samples, n)
+# plot_original_and_decoded_grouped(digit_samples, decoded_digit_samples, n)
+
+# Save decoded_digit_samples to a file
+with open("replay_buffer.pkl", "wb") as f:
+    pickle.dump(decoded_digit_samples, f)
+print("Replay buffer saved to replay_buffer.pkl")

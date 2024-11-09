@@ -3,6 +3,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import argparse as ap
 import torch
+import pickle
 from torch import nn
 from model_zoo.utils import *
 from model_zoo import datasets
@@ -133,10 +134,59 @@ def train_on_digit(digit, model, device, epochs=10):
     print(f"Overall Valid Accuracy (digit {digit}) = {valid_accuracy}")
     print(f"Accuracy on Digit 0 = {digit_0_accuracy}")
     print(f"Accuracy on Digit {digit} = {current_digit_accuracy}\n")
+    
+def train_on_digit_with_replay(digit, model, device, epochs=10):
+    digit_loader = get_digit_loader(digit, batch_size=args.batch_size, train=True)
+    model.train()
+
+    # Prepare replay buffer for digit 0
+    replay_images = torch.tensor(decoded_digit_samples[0], dtype=torch.float32).unsqueeze(1)  # Add channel dimension
+    replay_labels = torch.zeros(replay_images.size(0), dtype=torch.long)  # Label 0 for digit 0
+
+    for epoch in range(epochs):
+        running_loss = 0.0
+        for data, target in digit_loader:
+            # Concatenate replay buffer data with current digit's data
+            data = torch.cat([data, replay_images.to(device)], dim=0)
+            target = torch.cat([target, replay_labels.to(device)], dim=0)
+            
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+        
+        print(f"Digit {digit} - Epoch {epoch + 1}/{epochs}, Loss: {running_loss / len(digit_loader)}")
+
+    # Calculate and print accuracy metrics
+    overall_accuracy, _ = test(test_loader, model, device, criterion)
+    digit_0_accuracy = calculate_digit_accuracy(0, model, device)
+    current_digit_accuracy = calculate_digit_accuracy(digit, model, device)
+    
+    print(f"After training on digit {digit}:")
+    print(f"Overall Test Accuracy = {overall_accuracy}")
+    print(f"Overall Train Accuracy (digit {digit}) = {train_accuracy}")
+    print(f"Overall Valid Accuracy (digit {digit}) = {valid_accuracy}")
+    print(f"Accuracy on Digit 0 = {digit_0_accuracy}")
+    print(f"Accuracy on Digit {digit} = {current_digit_accuracy}\n")
 
 # Train separately on each digit for 10 epochs
-print("\nStarting additional training on each digit separately for 10 epochs each")
+# print("\nStarting additional training on each digit separately for 10 epochs each")
+# for digit in range(10):
+#     print(f"\nTraining on digit {digit} for 10 epochs")
+#     start = time.time()  # Track start time for each digit's training
+#     train_on_digit(digit, model, device, epochs=10)
+
+print("\nStarting training with the replay buffer for 10 digits")
+
+# Load replay buffer
+with open("replay_buffer.pkl", "rb") as f:
+    decoded_digit_samples = pickle.load(f)
+print("\nReplay buffer loaded successfully.")
+
 for digit in range(10):
     print(f"\nTraining on digit {digit} for 10 epochs")
     start = time.time()  # Track start time for each digit's training
-    train_on_digit(digit, model, device, epochs=10)
+    train_on_digit_with_replay(digit, model, device, epochs=10)

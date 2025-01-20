@@ -13,6 +13,7 @@ from model_zoo.datasets.digit_loader import get_digit_loader
 import time
 import copy
 import numpy as np
+import matplotlib.pyplot as plt
 
 parser = ap.ArgumentParser()
 parser.add_argument('--model', type=str, required=True)
@@ -45,8 +46,6 @@ elif args.dataset == 'cifar10':
     out_classes = 10
     test_loader = datasets.cifar10.load_test_data(batch_size=args.test_batch_size, cuda=cuda)
     train_loader, valid_loader = datasets.cifar10.load_train_val_data(batch_size=args.batch_size, train_val_split=args.train_ratio, cuda=cuda)
-
-
 
 if(args.model == "lenet"):
     model = models.LeNet(input_channels=input_channels, out_classes=out_classes)
@@ -91,232 +90,6 @@ scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[150, 250
 # print("VALID ACCURACY = {}".format(valid_accuracy))
 # print("TEST  ACCURACY = {}".format(test_accuracy))
 # print("\n\n\n\n")
-
-# Helper function to calculate accuracy on a specific digit
-def calculate_digit_accuracy(digit, model, device):
-    """Calculate accuracy on a specific digit from the test set."""
-    digit_loader = get_digit_loader(digit, batch_size=args.test_batch_size, train=False)
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for data, target in digit_loader:
-            data, target = data.to(device), target.to(device)
-            output = model(data)
-            _, predicted = torch.max(output, 1)
-            correct += (predicted == target).sum().item()
-            total += target.size(0)
-    return correct / total * 100 if total > 0 else 0
-
-# Additional training on each individual digit
-def train_on_digit(digit, model, device, epochs=10):
-    """Train the model on a specific digit and print relevant accuracy metrics."""
-    digit_loader = get_digit_loader(digit, batch_size=args.batch_size, train=True)
-    model.train()
-    for epoch in range(epochs):
-        running_loss = 0.0
-        for data, target in digit_loader:
-            data, target = data.to(device), target.to(device)
-            optimizer.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
-        print(f"Digit {digit} - Epoch {epoch + 1}/{epochs}, Loss: {running_loss / len(digit_loader)}")
-
-    # Calculate and print accuracy metrics
-    overall_accuracy, _ = test(test_loader, model, device, criterion)  # Overall accuracy on the test set
-    digit_0_accuracy = calculate_digit_accuracy(0, model, device)  # Accuracy on digit 0
-    current_digit_accuracy = calculate_digit_accuracy(digit, model, device)  # Accuracy on the current digit
-    
-    print(f"After training on digit {digit}:")
-    print(f"Overall Test Accuracy = {overall_accuracy}")
-    # print(f"Overall Train Accuracy (digit {digit}) = {train_accuracy}")
-    # print(f"Overall Valid Accuracy (digit {digit}) = {valid_accuracy}")
-    print(f"Accuracy on Digit 0 = {digit_0_accuracy}")
-    print(f"Accuracy on Digit {digit} = {current_digit_accuracy}\n")
-    
-def train_on_digit_with_replay(digit, model, device, epochs=10):
-    digit_loader = get_digit_loader(digit, batch_size=args.batch_size, train=True)
-    model.train()
-
-    # Prepare replay buffer for digit 0
-    replay_images = torch.tensor(decoded_digit_samples[0], dtype=torch.float32).unsqueeze(1)  # Add channel dimension
-    replay_labels = torch.zeros(replay_images.size(0), dtype=torch.long)  # Label 0 for digit 0
-
-    for epoch in range(epochs):
-        running_loss = 0.0
-        for data, target in digit_loader:
-            # Concatenate replay buffer data with current digit's data
-            data = torch.cat([data, replay_images.to(device)], dim=0)
-            target = torch.cat([target, replay_labels.to(device)], dim=0)
-            
-            data, target = data.to(device), target.to(device)
-            optimizer.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
-        
-        print(f"Digit {digit} - Epoch {epoch + 1}/{epochs}, Loss: {running_loss / len(digit_loader)}")
-
-    # Calculate and print accuracy metrics
-    overall_accuracy, _ = test(test_loader, model, device, criterion)
-    digit_0_accuracy = calculate_digit_accuracy(0, model, device)
-    current_digit_accuracy = calculate_digit_accuracy(digit, model, device)
-    
-    print(f"After training on digit {digit}:")
-    print(f"Overall Test Accuracy = {overall_accuracy}")
-    # print(f"Overall Train Accuracy (digit {digit}) = {train_accuracy}")
-    # print(f"Overall Valid Accuracy (digit {digit}) = {valid_accuracy}")
-    print(f"Accuracy on Digit 0 = {digit_0_accuracy}")
-    print(f"Accuracy on Digit {digit} = {current_digit_accuracy}\n")
-
-# Training function with interleaved data strategy
-def train_on_digit_with_interleaving(digit, model, device, epochs=5, batch_size=64):
-    print(f"\nTraining on digit {digit} with interleaved data...")
-    model.train()
-
-    # Load data for the current digit
-    current_digit_loader = get_digit_loader(digit, batch_size=batch_size, train=True)
-    
-    # Prepare interleaved dataset: 10% (100 samples) from all digits + 90% (900 samples) from the current digit
-    # all_digits_loaders = [get_digit_loader(d, batch_size=batch_size, train=True) for d in range(10)]
-    
-    # Prepare interleaved dataset: 10% (10 samples per digit) + 90% (900 samples) from the current digit
-    all_digits_data = []
-    for d in range(10):  # Loop through all digits
-        loader = get_digit_loader(d, batch_size=batch_size, train=True)
-        digit_samples = []
-        for data, labels in loader:
-            digit_samples.append((data, labels))
-            if len(digit_samples) >= 10:  # Collect exactly 10 samples per digit
-                break
-        all_digits_data.extend(digit_samples)
-
-        
-    # all_digits_data = [(x.to(device), y.to(device)) for x, y in all_digits_data]
-    
-    # Load full current digit data
-    current_digit_data = []
-    for data, labels in current_digit_loader:
-        current_digit_data.append((data.to(device), labels.to(device)))
-        if len(current_digit_data) >= 900:  # Limit to 900 samples
-            break
-
-    # Combine interleaved data
-    combined_data = all_digits_data + current_digit_data
-    combined_dataset = ConcatDataset([torch.utils.data.TensorDataset(x, y) for x, y in combined_data])
-    combined_loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=True)
-
-    # Training loop
-    for epoch in range(epochs):
-        running_loss = 0.0
-        for data, target in combined_loader:
-            data, target = data.to(device), target.to(device)
-            optimizer.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
-
-        print(f"Digit {digit} - Epoch {epoch + 1}/{epochs}, Loss: {running_loss / len(combined_loader)}")
-
-    # Test the model on seen digits up to this point
-    # test_seen_digits(model, device, digit)
-    
-    calculate_accuracies(model, device, digit)
-
-# Function to test accuracy on seen digits
-def test_seen_digits(model, device, max_digit):
-    model.eval()
-    total_correct = 0
-    total_samples = 0
-    with torch.no_grad():
-        for d in range(max_digit + 1):  # Only test on digits seen so far
-            loader = get_digit_loader(d, batch_size=64, train=False)
-            correct = 0
-            total = 0
-            for data, target in loader:
-                data, target = data.to(device), target.to(device)
-                output = model(data)
-                _, predicted = torch.max(output, 1)
-                correct += (predicted == target).sum().item()
-                total += target.size(0)
-            print(f"Accuracy on digit {d}: {100.0 * correct / total:.2f}%")
-            total_correct += correct
-            total_samples += total
-    print(f"Overall accuracy on seen digits: {100.0 * total_correct / total_samples:.2f}%\n")
-    
-def calculate_accuracies(model, device, max_seen_digit):
-    model.eval()
-    
-    # Initialize accuracy storage
-    total_correct_seen = 0
-    total_seen_samples = 0
-    total_correct_all = [0] * 10  # One counter for each digit
-    total_samples_all = [0] * 10  # One counter for each digit
-    
-    print(f"\nAccuracy results after training on digit {max_seen_digit}:\n")
-    with torch.no_grad():
-        for digit in range(10):
-            loader = get_digit_loader(digit, batch_size=64, train=False)
-            correct = 0
-            total = 0
-            for data, target in loader:
-                data, target = data.to(device), target.to(device)
-                output = model(data)
-                _, predicted = torch.max(output, 1)
-                correct += (predicted == target).sum().item()
-                total += target.size(0)
-            
-            # Store per-digit accuracy
-            total_correct_all[digit] = correct
-            total_samples_all[digit] = total
-            
-            # Print accuracy for each digit
-            if total > 0:
-                accuracy = 100.0 * correct / total
-                print(f"Accuracy on digit {digit}: {accuracy:.2f}%")
-            else:
-                print(f"Accuracy on digit {digit}: No samples available")
-            
-            # Add to "seen digits" if within max_seen_digit
-            if digit <= max_seen_digit:
-                total_correct_seen += correct
-                total_seen_samples += total
-    
-    # Calculate and print overall accuracy on seen digits
-    if total_seen_samples > 0:
-        overall_accuracy_seen_digits = 100.0 * total_correct_seen / total_seen_samples
-        print(f"\nOverall accuracy on seen digits (0–{max_seen_digit}): {overall_accuracy_seen_digits:.2f}%")
-    else:
-        print("\nNo samples available for seen digits")
-
-# Main training loop
-# for digit in range(10):
-#     train_on_digit_with_interleaving(digit, model, device, epochs=args.epochs, batch_size=args.batch_size)
-    
-# Train separately on each digit for 10 epochs
-# print("\nStarting additional training on each digit separately for 10 epochs each")
-# for digit in range(10):
-#     print(f"\nTraining on digit {digit} for 10 epochs")
-#     start = time.time()  # Track start time for each digit's training
-#     train_on_digit(digit, model, device, epochs=10)
-
-# print("\nStarting training with the replay buffer for 10 digits")
-# # Load replay buffer
-# with open("replay_buffer.pkl", "rb") as f:
-#     decoded_digit_samples = pickle.load(f)
-# print("\nReplay buffer loaded successfully.")
-
-# for digit in range(10):
-#     print(f"\nTraining on digit {digit} for 10 epochs")
-#     start = time.time()  # Track start time for each digit's training
-#     train_on_digit_with_replay(digit, model, device, epochs=10)
 
 # Helper function for evaluation
 def evaluate_accuracy(model, test_loader, device):
@@ -365,42 +138,53 @@ def sequential_train_without_buffer(model, device, criterion, optimizer, epochs,
         for i, acc in enumerate(per_digit_acc):
             print(f"Accuracy on Digit {i}: {acc:.2f}%")
 
-# Sequential training with incremental replay buffer
+# Sequential training with incremental replay buffer (using original images for buffer)
 def sequential_train_with_buffer(model, device, criterion, optimizer, epochs, test_loader):
     print("\nStarting sequential training with incremental replay buffer")
     replay_buffer = []
+
     for digit in range(10):
         print(f"\nTraining on digit {digit} with replay buffer for {epochs} epochs")
-        # Update replay buffer with 100 samples from the current digit
+        
+        # 1. Add 50 original images for each previously seen digit to the replay buffer
+        for seen_digit in range(digit):  
+            seen_digit_loader = get_digit_loader(seen_digit, batch_size=args.batch_size, train=True)
+            seen_digit_data = []
+            seen_digit_labels = []
+            for data, target in seen_digit_loader:
+                seen_digit_data.extend(data[:50])
+                seen_digit_labels.extend(target[:50])
+                if len(seen_digit_data) >= 50:
+                    seen_digit_data = seen_digit_data[:50]
+                    seen_digit_labels = seen_digit_labels[:50]
+                    break
+            replay_buffer.extend(zip(seen_digit_data, seen_digit_labels))
+
+        # 2. Add all the original images for the current digit
         digit_loader = get_digit_loader(digit, batch_size=args.batch_size, train=True)
-        digit_data = []
-        digit_labels = []
+        current_digit_images = []
+        current_digit_labels = []
         for data, target in digit_loader:
-            digit_data.extend(data[:100])
-            digit_labels.extend(target[:100])
-            if len(digit_data) >= 100:
-                digit_data = digit_data[:100]
-                digit_labels = digit_labels[:100]
-                break
-        replay_buffer.extend(zip(digit_data, digit_labels))
+            current_digit_images.extend(data)
+            current_digit_labels.extend(target)
+        current_digit_images = current_digit_images[:5000]  
+        current_digit_labels = current_digit_labels[:5000]
 
-        # Create combined loader
-        combined_data = [x[0] for x in replay_buffer]
-        combined_labels = [x[1] for x in replay_buffer]
-        combined_loader = DataLoader(
-            TensorDataset(torch.stack(combined_data), torch.tensor(combined_labels)),
-            batch_size=args.batch_size, shuffle=True
-        )
+        buffer_images = [img.clone().detach().unsqueeze(0) if len(img.shape) == 3 else img.clone().detach() for img, _ in replay_buffer]
+        buffer_labels = [torch.tensor(label, dtype=torch.long) for _, label in replay_buffer]
+        current_digit_images = [img.clone().detach().unsqueeze(0) for img in current_digit_images]
 
-        # Train on combined loader
+        combined_images = buffer_images + current_digit_images
+        combined_labels = buffer_labels + current_digit_labels
+
+        combined_dataset = TensorDataset(torch.cat(combined_images, dim=0), torch.tensor(combined_labels))
+        combined_loader = DataLoader(combined_dataset, batch_size=args.batch_size, shuffle=True)
+
+        # 3. Train on the combined dataset
         model.train()
         for epoch in range(epochs):
             running_loss = 0.0
             for i, (data, target) in enumerate(combined_loader):
-                if digit == 1 and epoch == 0 and i == 0:  # Print first batch data for digit 1
-                    print("\nFirst Batch Data (Digit 1):")
-                    print(f"Data Shape: {data.shape}")
-                    print(f"Labels: {target.tolist()}")
                 data, target = data.to(device), target.to(device)
                 optimizer.zero_grad()
                 output = model(data)
@@ -410,19 +194,216 @@ def sequential_train_with_buffer(model, device, criterion, optimizer, epochs, te
                 running_loss += loss.item()
             print(f"Digit {digit} - Epoch {epoch + 1}/{epochs}, Loss: {running_loss / len(combined_loader)}")
 
-        # Evaluate the model
+        # 4. Evaluate the model after training on each digit
         overall_acc, per_digit_acc = evaluate_accuracy(model, test_loader, device)
         print(f"After training on digit {digit} with replay buffer:")
         print(f"Overall Accuracy: {overall_acc:.2f}%")
         for i, acc in enumerate(per_digit_acc):
             print(f"Accuracy on Digit {i}: {acc:.2f}%")
 
+    
+# Sequential training with incremental replay buffer (using decoded images)
+def sequential_train_with_buffer_using_decoded(model, device, criterion, optimizer, epochs, test_loader):
+    print("\nStarting sequential training with decoded replay buffer")
+    
+    with open("replay_buffer.pkl", "rb") as f:
+        decoded_replay_buffer = pickle.load(f)
+        
+    print("Replay Buffer Keys:", decoded_replay_buffer.keys())
+    for digit, images in decoded_replay_buffer.items():
+        print(f"Digit {digit}: {len(images)} images")
+        print(f"Digit {digit}: Image Shape {images[0].shape}")
+        
+    print(f"Decoded images for Digit {digit}:")
+    decoded_images = decoded_replay_buffer[digit][:5]  
+    for i, img in enumerate(decoded_images):
+        plt.imshow(img, cmap="gray")
+        plt.title(f"Decoded Image {i} (Digit {digit})")
+        plt.axis("off")
+        plt.show()
+        
+    print("Decoded replay buffer loaded successfully.\n")
+
+    for digit in range(10):
+        print(f"\nTraining on digit {digit} with replay buffer for {epochs} epochs")
+        
+        # 1. Add 50 decoded images for each previously seen digit to the replay buffer
+        replay_images = []
+        replay_labels = []
+        for seen_digit in range(digit):  
+            decoded_images = decoded_replay_buffer[seen_digit][:50]  
+            replay_images.extend([torch.tensor(img, dtype=torch.float32).unsqueeze(0) for img in decoded_images])
+            replay_labels.extend([seen_digit] * len(decoded_images))  
+            
+        # 2. Add all the original images for the current digit
+        digit_loader = get_digit_loader(digit, batch_size=args.batch_size, train=True)
+        current_digit_images = []
+        current_digit_labels = []
+        for data, target in digit_loader:
+            current_digit_images.extend(data)
+            current_digit_labels.extend(target)
+        current_digit_images = current_digit_images[:5000]  
+        current_digit_labels = current_digit_labels[:5000]
+
+        # Combine replay buffer (decoded images) and current digit original data
+        buffer_images = [torch.tensor(img, dtype=torch.float32).unsqueeze(0) if len(img.shape) == 3 else torch.tensor(img, dtype=torch.float32) for img in replay_images]
+        buffer_labels = [torch.tensor(label, dtype=torch.long) for label in replay_labels]
+
+        current_digit_images = [img.unsqueeze(0) if len(img.shape) == 3 else img for img in current_digit_images]
+        current_digit_labels = [label for label in current_digit_labels]
+
+        # Ensure all images have 4 dimensions
+        combined_images = buffer_images + current_digit_images
+        combined_images = [img.unsqueeze(0) if len(img.shape) == 3 else img for img in combined_images]
+
+        combined_labels = buffer_labels + [torch.tensor(label, dtype=torch.long) for label in current_digit_labels]
+
+        # Stack tensors to create a dataset
+        combined_dataset = TensorDataset(torch.cat(combined_images, dim=0), torch.stack(combined_labels))
+        combined_loader = DataLoader(combined_dataset, batch_size=args.batch_size, shuffle=True)
+
+        # 3. Train on the combined dataset
+        model.train()
+        for epoch in range(epochs):
+            running_loss = 0.0
+            for i, (data, target) in enumerate(combined_loader):
+                data, target = data.to(device), target.to(device)
+                optimizer.zero_grad()
+                output = model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item()
+            print(f"Digit {digit} - Epoch {epoch + 1}/{epochs}, Loss: {running_loss / len(combined_loader)}")
+
+        # 4. Evaluate the model after training on each digit
+        overall_acc, per_digit_acc = evaluate_accuracy(model, test_loader, device)
+        print(f"After training on digit {digit} with replay buffer:")
+        print(f"Overall Accuracy: {overall_acc:.2f}%")
+        for i, acc in enumerate(per_digit_acc):
+            print(f"Accuracy on Digit {i}: {acc:.2f}%")
+            
+            
+def train_with_decoded_buffer_only(model, device, criterion, optimizer, epochs, batch_size):
+    print("\nStarting training with decoded buffer only")
+    
+    # Load the decoded replay buffer from the pickle file
+    with open("replay_buffer.pkl", "rb") as f:
+        decoded_replay_buffer = pickle.load(f)
+
+    print("Replay Buffer Keys:", decoded_replay_buffer.keys())
+    for digit, images in decoded_replay_buffer.items():
+        print(f"Digit {digit}: {len(images)} images")
+        print(f"Image Shape for Digit {digit}: {images[0].shape}")
+
+    buffer_images = []
+    buffer_labels = []
+    for digit in range(10): 
+        decoded_images = decoded_replay_buffer[digit][:50]  
+        buffer_images.extend([torch.tensor(img, dtype=torch.float32).unsqueeze(0) for img in decoded_images])
+        buffer_labels.extend([digit] * len(decoded_images))  
+        
+    buffer_images = [img.unsqueeze(0) if len(img.shape) == 3 else img for img in buffer_images]
+    buffer_labels = [torch.tensor(label, dtype=torch.long) for label in buffer_labels]
+
+    buffer_dataset = TensorDataset(torch.cat(buffer_images, dim=0), torch.stack(buffer_labels))
+    buffer_loader = DataLoader(buffer_dataset, batch_size=args.batch_size, shuffle=True)
+
+    # Train the model on the decoded buffer
+    model.train()
+    for epoch in range(epochs):
+        running_loss = 0.0
+        for data, target in buffer_loader:
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+        print(f"Epoch {epoch + 1}/{epochs}, Loss: {running_loss / len(buffer_loader)}")
+
+    # Evaluate the model after training
+    print("\nEvaluating model performance on decoded buffer...")
+    overall_acc, per_digit_acc = evaluate_accuracy(model, buffer_loader, device)
+    print(f"Overall Accuracy: {overall_acc:.2f}%")
+    for digit, acc in enumerate(per_digit_acc):
+        print(f"Accuracy on Digit {digit}: {acc:.2f}%")
+
+# Sequential training with only decoded buffer data
+def train_with_decoded_buffer_only_incremental(model, device, criterion, optimizer, epochs, test_loader):
+    print("\nStarting training with only decoded buffer data")
+    
+    with open("replay_buffer.pkl", "rb") as f:
+        decoded_replay_buffer = pickle.load(f)
+        
+    print("Replay Buffer Keys:", decoded_replay_buffer.keys())
+    for digit, images in decoded_replay_buffer.items():
+        print(f"Digit {digit}: {len(images)} images")
+        print(f"Digit {digit}: Image Shape {images[0].shape}")
+
+    print("Decoded replay buffer loaded successfully.\n")
+
+    replay_buffer_images = []
+    replay_buffer_labels = []
+
+    for digit in range(10):
+        print(f"\nTraining on digit {digit} with decoded buffer for {epochs} epochs")
+        
+        decoded_images = decoded_replay_buffer[digit][:50]  
+        replay_buffer_images.extend([torch.tensor(img, dtype=torch.float32).unsqueeze(0) for img in decoded_images])
+        replay_buffer_labels.extend([digit] * len(decoded_images))  
+        
+        buffer_images = [img.clone().detach() for img in replay_buffer_images]
+        buffer_labels = [torch.tensor(label, dtype=torch.long) for label in replay_buffer_labels]
+        
+        buffer_images = [img.unsqueeze(0) if len(img.shape) == 3 else img for img in buffer_images]
+        
+        buffer_dataset = TensorDataset(torch.cat(buffer_images, dim=0), torch.stack(buffer_labels))
+        buffer_loader = DataLoader(buffer_dataset, batch_size=args.batch_size, shuffle=True)
+
+        # Train on the buffer dataset
+        model.train()
+        for epoch in range(epochs):
+            running_loss = 0.0
+            for data, target in buffer_loader:
+                data, target = data.to(device), target.to(device)
+                optimizer.zero_grad()
+                output = model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item()
+            print(f"Digit {digit} - Epoch {epoch + 1}/{epochs}, Loss: {running_loss / len(buffer_loader)}")
+        
+        # Evaluate the model after training on each digit
+        overall_acc, per_digit_acc = evaluate_accuracy(model, test_loader, device)
+        print(f"After training on digit {digit} with decoded buffer:")
+        print(f"Overall Accuracy: {overall_acc:.2f}%")
+        for i, acc in enumerate(per_digit_acc):
+            print(f"Accuracy on Digit {i}: {acc:.2f}%")
+
+
 # Run the experiments
 print("Running experiments")
-sequential_train_without_buffer(model, device, criterion, optimizer, args.epochs, test_loader)
+# sequential_train_without_buffer(model, device, criterion, optimizer, args.epochs, test_loader)
 
 # Reset the model
-model = models.LeNet(input_channels=input_channels, out_classes=out_classes).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+# model = models.LeNet(input_channels=input_channels, out_classes=out_classes).to(device)
+# optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-sequential_train_with_buffer(model, device, criterion, optimizer, args.epochs, test_loader)
+# sequential_train_with_buffer(model, device, criterion, optimizer, args.epochs, test_loader)
+
+# Reset the model
+# model = models.LeNet(input_channels=input_channels, out_classes=out_classes).to(device)
+# optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+# train_with_decoded_buffer_only_incremental(model, device, criterion, optimizer, args.epochs, test_loader)
+
+# Reset the model
+# model = models.LeNet(input_channels=input_channels, out_classes=out_classes).to(device)
+# optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+# train_with_decoded_buffer_only(model, device, criterion, optimizer, args.epochs, test_loader)
+
+sequential_train_with_buffer_using_decoded(model, device, criterion, optimizer, args.epochs, test_loader)

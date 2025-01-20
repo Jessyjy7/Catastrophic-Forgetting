@@ -5,23 +5,21 @@ import matplotlib.pyplot as plt
 from hadamardHD import kronecker_hadamard, binding, unbinding, bundling, calculate_similarity
 from PYTORCHCNNS.model_zoo.datasets.digit_loader import get_digit_loader
 
-# Setup arguments
 parser = ap.ArgumentParser()
 parser.add_argument('-dataset', type=str, default="mnist", help="Dataset name")
 parser.add_argument('-n', type=int, default=5, help="Number of encoded samples to bundle per digit")
 args = parser.parse_args()
 
-# Step 1: Load data and encode as before
+# Load data and encode as before
 digit_loaders = {digit: get_digit_loader(digit, batch_size=64, train=True) for digit in range(10)}
 digit_samples = {digit: next(iter(digit_loaders[digit])) for digit in range(10)}
 
-D = 4096  # Encoded dimensionality
+D = 16384  # Encoded dimensionality
 vector_len = 1024
 base_matrix = np.random.uniform(-1, 1, (D, vector_len))
 base_matrix = np.where(base_matrix >= 0, 1, -1)
 pseudo_inverse = np.linalg.pinv(base_matrix)
 
-# Helper functions
 def encoding_rp(X_data, base_matrix, binary=False):
     enc_hvs = np.matmul(base_matrix, X_data.T)
     if binary:
@@ -35,9 +33,9 @@ for digit in range(10):
     images, labels = digit_samples[digit]
     images = images.view(images.size(0), -1)  # Flatten
     encoded_images = encoding_rp(images.numpy(), base_matrix, binary=False)
-    encoded_digit_samples[digit] = encoded_images[:n]  # Take first n samples
+    encoded_digit_samples[digit] = encoded_images[:n] 
 
-# Step 2: Bundle n encoded samples per digit
+# Bundle n encoded samples per digit
 bundled_hvs = {}
 for digit in range(10):
     bundled_HV = np.zeros(D)
@@ -48,7 +46,7 @@ for digit in range(10):
     bundled_hvs[digit] = bundled_HV
     print(f"Bundled HV for digit {digit} - Shape: {bundled_HV.shape}")
 
-# Step 3: Unbundle and decode
+# Unbundle and decode
 unbundled_digit_samples = {}
 decoded_digit_samples = {}
 for digit in range(10):
@@ -66,7 +64,7 @@ for digit in range(10):
     unbundled_digit_samples[digit] = unbundled_samples
     decoded_digit_samples[digit] = decoded_samples
 
-# Step 4: Calculate similarity between original encoded samples and unbundled samples
+# Calculate similarity between original encoded samples and unbundled samples
 # similarity_scores = {}
 # for digit in range(10):
 #     similarities = []
@@ -78,7 +76,7 @@ for digit in range(10):
 #     similarity_scores[digit] = similarities
 #     print(f"Similarity scores for digit {digit}: {similarities}")
 
-# Step 5: Visualize original and decoded images for each digit
+# Visualize original and decoded images for each digit
 def plot_original_and_decoded_grouped(digit_samples, decoded_digit_samples, n):
     fig, axes = plt.subplots(2 * n, 10, figsize=(20, 4 * n))
     fig.suptitle("Original and Decoded Images by Group (n={} per row)".format(n))
@@ -89,18 +87,42 @@ def plot_original_and_decoded_grouped(digit_samples, decoded_digit_samples, n):
             original_image = digit_samples[digit][0][j].reshape(32, 32)
             axes[2 * j, digit].imshow(original_image, cmap="gray")
             axes[2 * j, digit].axis("off")
-            axes[2 * j, digit].set_title(f"Original {digit} (n={j+1})", fontsize=7, pad=3)
+            # axes[2 * j, digit].set_title(f"Original {digit} (n={j+1})", fontsize=7, pad=3)
 
             # Decoded image for each n
             decoded_image = decoded_digit_samples[digit][j].reshape(32, 32)
             axes[2 * j + 1, digit].imshow(decoded_image, cmap="gray")
             axes[2 * j + 1, digit].axis("off")
-            axes[2 * j + 1, digit].set_title(f"Decoded {digit} (n={j+1})", fontsize=7, pad=3)
+            # axes[2 * j + 1, digit].set_title(f"Decoded {digit} (n={j+1})", fontsize=7, pad=3)
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # Adjust layout to avoid overlap
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) 
     plt.show()
     
 # plot_original_and_decoded_grouped(digit_samples, decoded_digit_samples, n)
+
+def plot_original_and_decoded_per_digit(digit_samples, decoded_digit_samples, n):
+    for digit in range(10):
+        # Create a figure for each digit
+        fig, axes = plt.subplots(2, n, figsize=(15, 5))  # Adjust figsize for better visualization
+        fig.suptitle(f"Original and Decoded Images for Digit {digit} (n={n})", fontsize=16)
+
+        for j in range(n):
+            # Plot the original image
+            original_image = digit_samples[digit][0][j].reshape(32, 32)
+            axes[0, j].imshow(original_image, cmap="gray")
+            axes[0, j].axis("off")
+            # axes[0, j].set_title(f"Original (n={j+1})", fontsize=8)
+
+            # Plot the decoded image
+            decoded_image = decoded_digit_samples[digit][j].reshape(32, 32)
+            axes[1, j].imshow(decoded_image, cmap="gray")
+            axes[1, j].axis("off")
+            # axes[1, j].set_title(f"Decoded (n={j+1})", fontsize=8)
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # Adjust layout to avoid overlap
+        plt.show()
+
+plot_original_and_decoded_per_digit(digit_samples, decoded_digit_samples, n)
 
 # Save decoded_digit_samples to a file
 with open("replay_buffer.pkl", "wb") as f:

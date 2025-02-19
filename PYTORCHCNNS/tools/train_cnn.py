@@ -393,7 +393,7 @@ def lifelong_learning(model, device, criterion, optimizer, test_loader, args):
         print(f"\nTraining on digit {digit} only for {args.epochs} epochs")
 
         # 1) Load digit data (CPU)
-        digit_loader = get_digit_loader(digit, batch_size=args.batch_size, train=True)
+        digit_loader = get_digit_loader(digit, train_set,batch_size=args.batch_size, train=True)
         
         # 2) Train for 'epochs' epochs
         model.train()
@@ -437,7 +437,7 @@ def lifelong_learning_with_buffer(model, device, criterion, optimizer, test_load
         
         # 1) Add some images for each previously seen digit to the replay buffer (CPU)
         for seen_digit in range(digit):  
-            seen_digit_loader = get_digit_loader(seen_digit, batch_size=args.batch_size, train=True)
+            seen_digit_loader = get_digit_loader(seen_digit, train_set, batch_size=args.batch_size, train=True)
             # We collect e.g. 5 images from the first batch
             for data, target in seen_digit_loader:
                 # 'data' is on CPU by default
@@ -448,7 +448,7 @@ def lifelong_learning_with_buffer(model, device, criterion, optimizer, test_load
                 break  # only the first batch for that digit
 
         # 2) Load the current digit's images
-        digit_loader = get_digit_loader(digit, batch_size=args.batch_size, train=True)
+        digit_loader = get_digit_loader(digit, train_set, batch_size=args.batch_size, train=True)
         current_digit_data = []
         current_digit_labels = []
         for data, target in digit_loader:
@@ -540,7 +540,7 @@ def lifelong_learning_with_buffer_using_decoded(model, device, criterion, optimi
                 replay_labels.append(torch.tensor(seen_digit, dtype=torch.long))
 
         # 2) Gather the current digit's images
-        digit_loader = get_digit_loader(digit, batch_size=args.batch_size, train=True)
+        digit_loader = get_digit_loader(digit, train_set,batch_size=args.batch_size, train=True)
         current_digit_images = []
         current_digit_labels = []
         for data, target in digit_loader:

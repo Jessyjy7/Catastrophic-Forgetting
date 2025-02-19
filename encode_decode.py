@@ -7,14 +7,14 @@ from PYTORCHCNNS.model_zoo.datasets.digit_loader import get_digit_loader
 
 parser = ap.ArgumentParser()
 parser.add_argument('-dataset', type=str, default="mnist", help="Dataset name")
-parser.add_argument('-n', type=int, default=5, help="Number of encoded samples to bundle per digit")
+parser.add_argument('-n', type=int, default=10, help="Number of encoded samples to bundle per digit")
 args = parser.parse_args()
 
 # Load data and encode as before
 digit_loaders = {digit: get_digit_loader(digit, batch_size=64, train=True) for digit in range(10)}
 digit_samples = {digit: next(iter(digit_loaders[digit])) for digit in range(10)}
 
-D = 16384  # Encoded dimensionality
+D = 131072  # Encoded dimensionality
 vector_len = 1024
 base_matrix = np.random.uniform(-1, 1, (D, vector_len))
 base_matrix = np.where(base_matrix >= 0, 1, -1)

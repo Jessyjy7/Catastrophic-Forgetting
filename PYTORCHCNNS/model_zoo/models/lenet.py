@@ -1,28 +1,33 @@
 import torch
 import torch.nn as nn
-from model_zoo.models.utils import * 
+import torch.nn.functional as F
 
-class LeNet(nn.Module):
-    def __init__(self, input_channels, out_classes):
-        super(LeNet, self).__init__()
-        structure = [6,16,120,84]
-        
-        self.features = nn.Sequential(
-                Convolution2D(input_channels, structure[0], k_size=5, stride=1, padding=0, with_bn=False, with_relu=True),
-                nn.MaxPool2d(2),
-                Convolution2D(structure[0], structure[1], k_size=5, stride=1, padding=0, with_bn=False, with_relu=True),
-                nn.MaxPool2d(2), 
-                Convolution2D(structure[1], structure[2], k_size=5, stride=1, padding=0, with_bn=False, with_relu=True)
-                )
-
-        self.classifier = nn.Sequential(
-            FullyConnected(structure[2], structure[3], with_relu=True),
-            FullyConnected(structure[3], out_classes, with_relu=False)
-            )
-        
+# LeNet Feature Extractor (LeNet_Pre) - Extracting FC2 Features
+class LeNet_Pre(nn.Module):
+    def __init__(self):
+        super(LeNet_Pre, self).__init__()
+        self.conv1 = nn.Conv2d(1, 6, 5)  
+        self.pool = nn.MaxPool2d(2, 2)    
+        self.conv2 = nn.Conv2d(6, 16, 5)  
+        self.fc1 = nn.Linear(16 * 5 * 5, 120)  
+        self.fc2 = nn.Linear(120, 84)  
 
     def forward(self, x):
-        x = self.features(x)
-        x = torch.reshape(x, (x.shape[0], -1))
-        x = self.classifier(x)
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = x.view(-1, 16 * 5 * 5)
+        x = F.relu(self.fc1(x))
+        features = F.relu(self.fc2(x))  
+        # print(f"Extracted FC2 Shape: {features.shape}")
+        return features  
+
+
+# LeNet Classifier (LeNet_Out) - Uses FC2 Features Directly
+class LeNet_Out(nn.Module):
+    def __init__(self):
+        super(LeNet_Out, self).__init__()
+        self.fc3 = nn.Linear(84, 10)  
+
+    def forward(self, features):
+        x = self.fc3(features)  
         return x

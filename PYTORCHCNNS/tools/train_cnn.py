@@ -308,7 +308,7 @@ def sequential_train_with_buffer_using_decoded(model, device, criterion, optimiz
 
 def train_with_decoded_buffer_only(model, device, criterion, optimizer, epochs, batch_size, args):
     """
-    Train using ONLY the decoded replay buffer (no fresh MNIST data).
+    Train using ONLY the decoded replay buffer.
     """
     print("\n=== Starting training with decoded buffer ONLY ===")
     with open("../../replay_buffer.pkl", "rb") as f:

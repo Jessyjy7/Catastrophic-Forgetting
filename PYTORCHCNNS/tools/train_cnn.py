@@ -517,7 +517,7 @@ def lifelong_learning_with_buffer_using_decoded(model, device, criterion, optimi
     """
     print("\nStarting sequential training with decoded replay buffer")
     
-    with open("replay_buffer.pkl", "rb") as f:
+    with open("../../replay_buffer.pkl", "rb") as f:
         decoded_replay_buffer = pickle.load(f)
 
     for digit, images in decoded_replay_buffer.items():

@@ -3,10 +3,9 @@ from torchvision.datasets import MNIST
 import torchvision.transforms as tvt
 
 def get_digit_loader(digit=None, batch_size=64, train=True):
-    # Load the MNIST dataset with transformations
+    # Load the MNIST dataset WITHOUT resizing to 32x32
     transform = tvt.Compose([
-        tvt.Resize((32, 32)),  # Resize to 32x32 to match model input size
-        tvt.ToTensor()
+        tvt.ToTensor()  # keep original 28x28
     ])
     dataset = MNIST(root='./datasets/mnist', train=train, download=True, transform=transform)
 

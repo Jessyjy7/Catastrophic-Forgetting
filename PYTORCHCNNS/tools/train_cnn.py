@@ -225,52 +225,63 @@ def sequential_train_with_buffer(model, device, criterion, optimizer, epochs, te
 def sequential_train_with_buffer_using_decoded(model, device, criterion, optimizer, epochs, test_loader, args, train_set):
     """
     Sequential training with a decoded replay buffer (e.g. from 'replay_buffer.pkl').
+    All replay and current images remain on CPU until we create the DataLoader. 
+    In the training loop, we then move data/labels to GPU.
     """
     print("\n=== Starting sequential training with DECODED replay buffer ===")
 
+    # 1. Load the decoded replay buffer from a file
     with open("../../replay_buffer.pkl", "rb") as f:
         decoded_replay_buffer = pickle.load(f)
 
     for digit, images in decoded_replay_buffer.items():
         print(f"Digit {digit}: {len(images)} images (Decoded)")
 
+    # 2. For each digit 0..9
     for digit in range(10):
         print(f"\nTraining on digit {digit} with decoded replay buffer for {epochs} epochs")
 
-        # 1. Collect decoded images for previously seen digits
+        # 2.1. Collect "decoded" replay images for all previously seen digits
         replay_images = []
         replay_labels = []
         for seen_digit in range(digit):
             decoded_images = decoded_replay_buffer[seen_digit]  # list of numpy arrays
             for img_np in decoded_images:
-                img_t = torch.tensor(img_np, dtype=torch.float32)
+                # Create a CPU tensor from the numpy array
+                img_t = torch.tensor(img_np, dtype=torch.float32)  # stays on CPU
                 if img_t.dim() == 2:
-                    img_t = img_t.unsqueeze(0)  # [1, H, W]
-                # If MobileNet, replicate channels
+                    # shape [H,W] -> [1,H,W]
+                    img_t = img_t.unsqueeze(0)
+                # If using MobileNet, replicate single channel to 3
                 if args.model == 'mobilenet' and img_t.shape[0] == 1:
                     img_t = img_t.repeat(3, 1, 1)
                 replay_images.append(img_t)
-                replay_labels.append(torch.tensor(seen_digit, dtype=torch.long))
+                replay_labels.append(torch.tensor(seen_digit, dtype=torch.long))  # also CPU
 
-        # 2. Gather current digit images from train_set
+        # 2.2. Collect "current" digit images from train_set (on CPU)
         digit_loader = get_digit_loader(digit, train_set, batch_size=args.batch_size, train=True)
         current_digit_images = []
         current_digit_labels = []
         for data, target in digit_loader:
-            data, target = data.to(device), target.to(device)
+            # NOTE: remove the lines that move to GPU here.
+            # We'll keep data/target on CPU for concatenation.
             if args.model == 'mobilenet':
                 data = replicate_channels(data)
+            # Extend CPU lists
             current_digit_images.extend(data)
             current_digit_labels.extend(target)
 
-        # Combine
+        # 3. Combine replay + current into single CPU list
         combined_images = []
         combined_labels = []
 
+        # Replay images (CPU)
         for i, img in enumerate(replay_images):
+            # If 3D => shape [C,H,W], we make it [1,C,H,W] for cat
             combined_images.append(img.unsqueeze(0) if img.dim() == 3 else img)
             combined_labels.append(replay_labels[i])
 
+        # Current images (CPU)
         for i, img in enumerate(current_digit_images):
             combined_images.append(img.unsqueeze(0) if img.dim() == 3 else img)
             combined_labels.append(current_digit_labels[i])
@@ -279,17 +290,20 @@ def sequential_train_with_buffer_using_decoded(model, device, criterion, optimiz
             print("No data for digit", digit)
             continue
 
-        combined_images_tensor = torch.cat(combined_images, dim=0)
-        combined_labels_tensor = torch.stack(combined_labels)
+        # 4. Now we can safely cat on CPU
+        combined_images_tensor = torch.cat(combined_images, dim=0)  # all CPU
+        combined_labels_tensor = torch.stack(combined_labels)       # also CPU
 
+        # Create a CPU dataset
         combined_dataset = TensorDataset(combined_images_tensor, combined_labels_tensor)
         combined_loader = DataLoader(combined_dataset, batch_size=args.batch_size, shuffle=True)
 
-        # 3. Train
+        # 5. Training Loop (finally move data to GPU)
         model.train()
         for epoch in range(epochs):
             running_loss = 0.0
             for data, target in combined_loader:
+                # Move data, target to GPU here
                 data, target = data.to(device), target.to(device)
                 optimizer.zero_grad()
                 output = model(data)
@@ -299,12 +313,13 @@ def sequential_train_with_buffer_using_decoded(model, device, criterion, optimiz
                 running_loss += loss.item()
             print(f"Digit {digit} - Epoch {epoch+1}/{epochs}, Loss: {running_loss/len(combined_loader):.4f}")
 
-        # 4. Evaluate
+        # 6. Evaluate on the test_loader
         overall_acc, per_digit_acc = evaluate_accuracy(model, test_loader, device, args.model)
         print(f"After training on digit {digit} with decoded replay buffer:")
         print(f"Overall Accuracy: {overall_acc:.2f}%")
         for i, acc in enumerate(per_digit_acc):
             print(f"Accuracy on Digit {i}: {acc:.2f}%")
+
 
 def train_with_decoded_buffer_only(model, device, criterion, optimizer, epochs, batch_size, args):
     """

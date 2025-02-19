@@ -378,6 +378,225 @@ def train_with_decoded_buffer_only(model, device, criterion, optimizer, epochs, 
     print(f"Overall Accuracy: {overall_acc:.2f}%")
     for digit, acc in enumerate(per_digit_acc):
         print(f"Accuracy on Digit {digit}: {acc:.2f}%")
+        
+        
+        
+        
+def lifelong_learning(model, device, criterion, optimizer, test_loader, args):
+    """
+    Sequential training on digits 0..9 WITHOUT a replay buffer.
+    Data is loaded digit by digit, 
+    then in the final loop we move it to GPU and replicate channels if needed.
+    """
+    print("\nStarting sequential training without replay buffer")
+    for digit in range(10):
+        print(f"\nTraining on digit {digit} only for {args.epochs} epochs")
+
+        # 1) Load digit data (CPU)
+        digit_loader = get_digit_loader(digit, batch_size=args.batch_size, train=True)
+        
+        # 2) Train for 'epochs' epochs
+        model.train()
+        for epoch in range(args.epochs):
+            running_loss = 0.0
+            for data, target in digit_loader:
+                # Only now do we move data to GPU (and replicate if mobilenet).
+                if args.model == 'mobilenet':
+                    data = replicate_channels(data)
+                data, target = data.to(device), target.to(device)
+
+                optimizer.zero_grad()
+                output = model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item()
+
+            print(f"Digit {digit}, Epoch {epoch+1}/{args.epochs}, Loss: {running_loss / len(digit_loader):.4f}")
+
+        # 3) Evaluate
+        overall_acc, per_digit_acc = evaluate_accuracy(model, test_loader, device)
+        print(f"After training on digit {digit}:")
+        print(f"Overall Accuracy: {overall_acc:.2f}%")
+        for i, acc in enumerate(per_digit_acc):
+            print(f"Accuracy on Digit {i}: {acc:.2f}%")
+
+
+
+def lifelong_learning_with_buffer(model, device, criterion, optimizer, test_loader, args):
+    """
+    Sequential training with an incremental replay buffer of original images.
+    We'll store replay images on CPU. 
+    Only in the final training loop do we move them to GPU and replicate channels if needed.
+    """
+    print("\nStarting sequential training with incremental replay buffer")
+    replay_buffer = []  # will store (img_cpu, label)
+
+    for digit in range(10):
+        print(f"\nTraining on digit {digit} with replay buffer for {args.epochs} epochs")
+        
+        # 1) Add some images for each previously seen digit to the replay buffer (CPU)
+        for seen_digit in range(digit):  
+            seen_digit_loader = get_digit_loader(seen_digit, batch_size=args.batch_size, train=True)
+            # We collect e.g. 5 images from the first batch
+            for data, target in seen_digit_loader:
+                # 'data' is on CPU by default
+                # Just store them directly. We do not .to(device) yet.
+                # We can store fewer images if we want, e.g. data[:5]
+                for i in range(min(5, data.shape[0])):
+                    replay_buffer.append((data[i], target[i]))
+                break  # only the first batch for that digit
+
+        # 2) Load the current digit's images
+        digit_loader = get_digit_loader(digit, batch_size=args.batch_size, train=True)
+        current_digit_data = []
+        current_digit_labels = []
+        for data, target in digit_loader:
+            # also on CPU
+            for i in range(data.shape[0]):
+                current_digit_data.append(data[i])
+                current_digit_labels.append(target[i])
+        # Now we have CPU-based lists for current digit
+
+        # 3) Combine replay buffer + current digit
+        combined_data = []
+        combined_labels = []
+        # replay buffer
+        for (img_cpu, lbl_cpu) in replay_buffer:
+            combined_data.append(img_cpu.unsqueeze(0) if img_cpu.dim() == 3 else img_cpu)
+            combined_labels.append(lbl_cpu)
+        # current digit
+        for i in range(len(current_digit_data)):
+            img_cpu = current_digit_data[i]
+            lbl_cpu = current_digit_labels[i]
+            combined_data.append(img_cpu.unsqueeze(0) if img_cpu.dim() == 3 else img_cpu)
+            combined_labels.append(lbl_cpu)
+
+        if len(combined_data) == 0:
+            print("No data to train on. Skipping digit", digit)
+            continue
+
+        # 4) Stack into a single CPU dataset
+        combined_images_tensor = torch.cat(combined_data, dim=0)  # shape [N, C, H, W]
+        combined_labels_tensor = torch.stack(combined_labels)     # shape [N]
+        combined_dataset = TensorDataset(combined_images_tensor, combined_labels_tensor)
+        combined_loader = DataLoader(combined_dataset, batch_size=args.batch_size, shuffle=True)
+
+        # 5) Train for 'epochs' epochs
+        model.train()
+        for epoch in range(args.epochs):
+            running_loss = 0.0
+            for data, target in combined_loader:
+                # Now do device + replicate
+                if args.model == 'mobilenet':
+                    data = replicate_channels(data)
+                data, target = data.to(device), target.to(device)
+
+                optimizer.zero_grad()
+                output = model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item()
+            print(f"Digit {digit}, Epoch {epoch+1}/{args.epochs}, Loss: {running_loss/len(combined_loader):.4f}")
+
+        # 6) Evaluate
+        overall_acc, per_digit_acc = evaluate_accuracy(model, test_loader, device)
+        print(f"After training on digit {digit} with replay buffer:")
+        print(f"Overall Accuracy: {overall_acc:.2f}%")
+        for i, acc in enumerate(per_digit_acc):
+            print(f"Accuracy on Digit {i}: {acc:.2f}%")
+
+
+
+
+def lifelong_learning_with_buffer_using_decoded(model, device, criterion, optimizer, test_loader, args):
+    """
+    Sequential training with a decoded replay buffer (replay_buffer.pkl).
+    We'll unify everything on CPU, then in final training loop, move to GPU & replicate if needed.
+    """
+    print("\nStarting sequential training with decoded replay buffer")
+    
+    with open("replay_buffer.pkl", "rb") as f:
+        decoded_replay_buffer = pickle.load(f)
+
+    for digit, images in decoded_replay_buffer.items():
+        print(f"Digit {digit}: {len(images)} images")
+
+    for digit in range(10):
+        print(f"\nTraining on digit {digit} with decoded buffer for {args.epochs} epochs")
+
+        # 1) Gather decoded images for previously seen digits (CPU)
+        replay_images = []
+        replay_labels = []
+        for seen_digit in range(digit):
+            decoded_images = decoded_replay_buffer[seen_digit]
+            for img_np in decoded_images:
+                # Create a CPU tensor
+                img_t = torch.tensor(img_np, dtype=torch.float32)
+                if img_t.dim() == 2:
+                    img_t = img_t.unsqueeze(0)  # => [1,H,W]
+                replay_images.append(img_t)
+                replay_labels.append(torch.tensor(seen_digit, dtype=torch.long))
+
+        # 2) Gather the current digit's images
+        digit_loader = get_digit_loader(digit, batch_size=args.batch_size, train=True)
+        current_digit_images = []
+        current_digit_labels = []
+        for data, target in digit_loader:
+            # data is on CPU
+            for i in range(data.shape[0]):
+                current_digit_images.append(data[i])
+                current_digit_labels.append(target[i])
+
+        # 3) Combine CPU replay + current
+        combined_images = []
+        combined_labels = []
+
+        # replay
+        for i, img in enumerate(replay_images):
+            combined_images.append(img.unsqueeze(0) if img.dim() == 3 else img)
+            combined_labels.append(replay_labels[i])
+        # current
+        for i, img in enumerate(current_digit_images):
+            combined_images.append(img.unsqueeze(0) if img.dim() == 3 else img)
+            combined_labels.append(current_digit_labels[i])
+
+        if len(combined_images) == 0:
+            print("No data for digit", digit)
+            continue
+
+        combined_images_tensor = torch.cat(combined_images, dim=0)   # CPU
+        combined_labels_tensor = torch.stack(combined_labels)        # CPU
+        combined_dataset = TensorDataset(combined_images_tensor, combined_labels_tensor)
+        combined_loader = DataLoader(combined_dataset, batch_size=args.batch_size, shuffle=True)
+
+        # 4) Training
+        model.train()
+        for epoch in range(args.epochs):
+            running_loss = 0.0
+            for data, target in combined_loader:
+                # Now move to GPU + replicate if mobilenet
+                if args.model == 'mobilenet':
+                    data = replicate_channels(data)
+                data, target = data.to(device), target.to(device)
+
+                optimizer.zero_grad()
+                output = model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item()
+
+            print(f"Digit {digit}, Epoch {epoch+1}/{args.epochs}, Loss: {running_loss/len(combined_loader):.4f}")
+
+        # 5) Evaluate
+        overall_acc, per_digit_acc = evaluate_accuracy(model, test_loader, device)
+        print(f"After training on digit {digit} with decoded buffer:")
+        print(f"Overall Accuracy: {overall_acc:.2f}%")
+        for i, acc in enumerate(per_digit_acc):
+            print(f"Accuracy on Digit {i}: {acc:.2f}%")
+
 
 ##############################################################################
 # MAIN SCRIPT
@@ -447,8 +666,13 @@ if __name__ == "__main__":
     # Example usage: pick whichever training function you want:
     # sequential_train_without_buffer(model, device, criterion, optimizer, args.epochs, test_loader, args, train_set)
     # sequential_train_with_buffer(model, device, criterion, optimizer, args.epochs, test_loader, args, train_set)
-    sequential_train_with_buffer_using_decoded(model, device, criterion, optimizer, args.epochs, test_loader, args, train_set)
+    # sequential_train_with_buffer_using_decoded(model, device, criterion, optimizer, args.epochs, test_loader, args, train_set)
     # train_with_decoded_buffer_only(model, device, criterion, optimizer, args.epochs, args.batch_size, args)
+    
+    # lifelong_learning(model, device, criterion, optimizer, test_loader, args)
+    # lifelong_learning_with_buffer(model, device, criterion, optimizer, test_loader, args)
+    lifelong_learning_with_buffer_using_decoded(model, device, criterion, optimizer, test_loader, args)
+
 
     print("\n===== All Experiments Completed Successfully! =====")
 

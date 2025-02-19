@@ -415,7 +415,7 @@ def lifelong_learning(model, device, criterion, optimizer, test_loader, args):
             print(f"Digit {digit}, Epoch {epoch+1}/{args.epochs}, Loss: {running_loss / len(digit_loader):.4f}")
 
         # 3) Evaluate
-        overall_acc, per_digit_acc = evaluate_accuracy(model, test_loader, device)
+        overall_acc, per_digit_acc = evaluate_accuracy(model, test_loader, device, args.model)
         print(f"After training on digit {digit}:")
         print(f"Overall Accuracy: {overall_acc:.2f}%")
         for i, acc in enumerate(per_digit_acc):
@@ -501,7 +501,7 @@ def lifelong_learning_with_buffer(model, device, criterion, optimizer, test_load
             print(f"Digit {digit}, Epoch {epoch+1}/{args.epochs}, Loss: {running_loss/len(combined_loader):.4f}")
 
         # 6) Evaluate
-        overall_acc, per_digit_acc = evaluate_accuracy(model, test_loader, device)
+        overall_acc, per_digit_acc = evaluate_accuracy(model, test_loader, device, args.model)
         print(f"After training on digit {digit} with replay buffer:")
         print(f"Overall Accuracy: {overall_acc:.2f}%")
         for i, acc in enumerate(per_digit_acc):
@@ -591,7 +591,7 @@ def lifelong_learning_with_buffer_using_decoded(model, device, criterion, optimi
             print(f"Digit {digit}, Epoch {epoch+1}/{args.epochs}, Loss: {running_loss/len(combined_loader):.4f}")
 
         # 5) Evaluate
-        overall_acc, per_digit_acc = evaluate_accuracy(model, test_loader, device)
+        overall_acc, per_digit_acc = evaluate_accuracy(model, test_loader, device, args.model)
         print(f"After training on digit {digit} with decoded buffer:")
         print(f"Overall Accuracy: {overall_acc:.2f}%")
         for i, acc in enumerate(per_digit_acc):

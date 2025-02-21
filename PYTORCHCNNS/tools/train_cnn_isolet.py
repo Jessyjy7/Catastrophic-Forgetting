@@ -145,7 +145,7 @@ from torch.utils.data import TensorDataset, DataLoader
 def sequential_train_with_buffer_using_decoded(model, device, criterion, optimizer, epochs, test_loader, args):
     print("\nStarting sequential training with decoded replay buffer")
 
-    buffer_path = "/Users/jessyjy7/Desktop/Catastrophic-Forgetting/replay_buffer_isolet.pkl"
+    buffer_path = "../../replay_buffer_isolet.pkl"
 
     # Load the replay buffer
     with open(buffer_path, "rb") as f:

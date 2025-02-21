@@ -29,7 +29,7 @@ def encoding_rp(X_data, base_matrix, binary=False):
 def bundle_encoded_samples(encoded_samples, D, n):
     """
     Bundles n encoded samples per letter by binding each sample with a unique key
-    (keys are generated on the fly from the Hadamard matrix scaled by 2) and then summing.
+    using circular convolution, then summing the bound vectors.
     """
     bundled_hvs = {}
     for letter, encoded in encoded_samples.items():
@@ -44,8 +44,8 @@ def bundle_encoded_samples(encoded_samples, D, n):
 def unbundle_and_decode(bundled_hvs, pseudo_inverse, D, n):
     """
     Unbundles and decodes hypervectors. For each letter, each of the n bound items is
-    recovered using the unbinding operation (element-wise division by the corresponding key)
-    and then decoded via multiplication with the pseudo-inverse.
+    recovered using circular correlation (the inverse of circular convolution) and then
+    decoded via multiplication with the pseudo-inverse.
     """
     unbundled_letter_samples = {}
     decoded_letter_samples = {}
@@ -86,14 +86,13 @@ for letter in letters:
     # Use only the first n samples per letter
     encoded_letter_samples[letter] = encoded_features[:args.n]
 
-# Bundle the encoded samples (keys are generated on the fly)
+# Bundle the encoded samples using circular convolution binding
 bundled_hvs = bundle_encoded_samples(encoded_letter_samples, D, args.n)
 
-# Unbundle and decode the bundled hypervectors
+# Unbundle and decode the bundled hypervectors using circular correlation
 unbundled_letter_samples, decoded_letter_samples = unbundle_and_decode(bundled_hvs, pseudo_inverse, D, args.n)
 
 # Save the decoded replay buffer to a pickle file
 with open(args.output, "wb") as f:
     pickle.dump(decoded_letter_samples, f)
 print(f"Replay buffer saved to {args.output}")
-

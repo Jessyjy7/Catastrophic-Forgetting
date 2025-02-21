@@ -17,17 +17,20 @@ parser.add_argument('-train', type=bool, default=True, help="Use training datase
 parser.add_argument('-output', type=str, default="replay_buffer_isolet.pkl", help="Output file for replay buffer")
 args = parser.parse_args()
 
-
 def encoding_rp(X_data, base_matrix, binary=False):
-    """Encodes input feature vectors into hypervectors using random projection."""
+    """
+    Encodes input feature vectors into hypervectors using random projection.
+    """
     enc_hvs = np.matmul(base_matrix, X_data.T)
     if binary:
         enc_hvs = np.where(enc_hvs < 0, -1, 1)
     return enc_hvs.T
 
-
 def bundle_encoded_samples(encoded_samples, D, n):
-    """Bundles n encoded samples per letter."""
+    """
+    Bundles n encoded samples per letter by binding each sample with a unique key
+    (keys are generated on the fly from the Hadamard matrix scaled by 2) and then summing.
+    """
     bundled_hvs = {}
     for letter, encoded in encoded_samples.items():
         bundled_HV = np.zeros(D)
@@ -38,9 +41,12 @@ def bundle_encoded_samples(encoded_samples, D, n):
         print(f"Bundled HV for letter {letter} - Shape: {bundled_HV.shape}")
     return bundled_hvs
 
-
 def unbundle_and_decode(bundled_hvs, pseudo_inverse, D, n):
-    """Unbundles and decodes hypervectors."""
+    """
+    Unbundles and decodes hypervectors. For each letter, each of the n bound items is
+    recovered using the unbinding operation (element-wise division by the corresponding key)
+    and then decoded via multiplication with the pseudo-inverse.
+    """
     unbundled_letter_samples = {}
     decoded_letter_samples = {}
 
@@ -59,26 +65,35 @@ def unbundle_and_decode(bundled_hvs, pseudo_inverse, D, n):
     
     return unbundled_letter_samples, decoded_letter_samples
 
-
+# Load data for each letter using the provided loader
 letters = list(args.letters)
-letter_loaders = {letter: get_letter_loader(letter, batch_size=args.batch_size, train=args.train) for letter in letters}
+letter_loaders = {letter: get_letter_loader(letter, batch_size=args.batch_size, train=args.train)
+                  for letter in letters}
 letter_samples = {letter: next(iter(letter_loaders[letter])) for letter in letters}
 
+# Set up the random projection base matrix (using bipolar values)
 D = args.D  
 vector_len = args.vector_len  
 base_matrix = np.random.uniform(-1, 1, (D, vector_len))
 base_matrix = np.where(base_matrix >= 0, 1, -1)
 pseudo_inverse = np.linalg.pinv(base_matrix)
 
+# Encode the letter samples
 encoded_letter_samples = {}
 for letter in letters:
     features, _ = letter_samples[letter]
     encoded_features = encoding_rp(features.numpy(), base_matrix, binary=False)
-    encoded_letter_samples[letter] = encoded_features[:args.n] 
+    # Use only the first n samples per letter
+    encoded_letter_samples[letter] = encoded_features[:args.n]
 
+# Bundle the encoded samples (keys are generated on the fly)
 bundled_hvs = bundle_encoded_samples(encoded_letter_samples, D, args.n)
+
+# Unbundle and decode the bundled hypervectors
 unbundled_letter_samples, decoded_letter_samples = unbundle_and_decode(bundled_hvs, pseudo_inverse, D, args.n)
 
+# Save the decoded replay buffer to a pickle file
 with open(args.output, "wb") as f:
     pickle.dump(decoded_letter_samples, f)
 print(f"Replay buffer saved to {args.output}")
+

@@ -61,7 +61,7 @@ def unbinding (hv_length, i, binded_HV):
     unbound_HV = np.zeros(hv_length)
     key_vector = kronecker_hadamard(hv_length, i)
     key_inverse = np.reciprocal(key_vector)
-    unbound_HV = binded_HV * key_inverse
+    unbound_HV = key_inverse * binded_HV
     # unbinded_HV.append(projection)
     print(f"Unbound HV for {i}: {unbound_HV}")
     return unbound_HV
@@ -71,7 +71,7 @@ def unbundling (hv_length, n_hvs, bundled_HV):
     for i in range(n_hvs):
         key_vector = kronecker_hadamard(hv_length, i)
         key_inverse = np.reciprocal(key_vector)
-        projection = bundled_HV * key_inverse
+        projection = key_inverse * bundled_HV
         unbundled_hvs.append(projection)
         print(f"Unbundled HV for {i} index: {projection}")
     print(f"\n")

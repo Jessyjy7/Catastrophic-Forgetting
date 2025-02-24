@@ -96,3 +96,20 @@ unbundled_letter_samples, decoded_letter_samples = unbundle_and_decode(bundled_h
 with open(args.output, "wb") as f:
     pickle.dump(decoded_letter_samples, f)
 print(f"Replay buffer saved to {args.output}")
+
+# After decoding and saving the pickle file, add:
+for letter in letters:
+    # Get the original features (convert torch tensor to numpy)
+    features, _ = letter_samples[letter]
+    # Use only the first n samples (same as encoded)
+    original_samples = features.numpy()[:args.n]
+    
+    print(f"\nLetter: {letter}")
+    for i in range(args.n):
+        original = original_samples[i]
+        decoded = decoded_letter_samples[letter][i]
+        diff_norm = np.linalg.norm(original - decoded)
+        print(f"Sample {i}:")
+        print("Original: ", original)
+        print("Decoded:  ", decoded)
+        print("L2 Difference Norm: ", diff_norm)

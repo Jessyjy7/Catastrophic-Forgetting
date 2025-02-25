@@ -109,7 +109,11 @@ for letter in letters:
         original = original_samples[i]
         decoded = decoded_letter_samples[letter][i]
         diff_norm = np.linalg.norm(original - decoded)
+        norm = np.linalg.norm(original)
+        relative_error = diff_norm / norm
         print(f"Sample {i}:")
-        print("Original: ", original)
-        print("Decoded:  ", decoded)
+        # print("Original: ", original)
+        # print("Decoded:  ", decoded)
+        print("L2 Original: ", norm)
         print("L2 Difference Norm: ", diff_norm)
+        print("Relative Error: ", relative_error)

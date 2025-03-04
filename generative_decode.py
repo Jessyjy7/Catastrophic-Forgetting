@@ -1,3 +1,4 @@
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,8 +7,6 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import MNIST
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
-
-# For SSIM computation
 from pytorch_msssim import ssim as ssim_func
 
 # -------------------------------
@@ -179,10 +178,8 @@ def compute_ssim(model, device, batch_size=64):
             outputs = model(images)
 
             # Ensure values are in [0,1] for SSIM
-            # If your model output is already in [0,1], this is not strictly necessary
             outputs = torch.clamp(outputs, 0.0, 1.0)
 
-            # Compute SSIM for the batch; shape is [N, 1, H, W]
             # ssim_func returns a single scalar if shape is NxCxHxW
             batch_ssim = ssim_func(images, outputs, data_range=1.0, size_average=True)
             ssim_scores.append(batch_ssim.item())
@@ -228,24 +225,38 @@ def show_original_decoded(model, device, num_images=8):
     plt.tight_layout()
     plt.show()
 
+    # Save figure to file if you want
     plt.savefig("decoded_comparison.png")
-
+    print("Plot saved as decoded_comparison.png")
 
 # -------------------------------
-# 3) Main Script
+# 3) Main Script with argparse
 # -------------------------------
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train a U-Net style autoencoder on MNIST.")
+    parser.add_argument("--epochs", type=int, default=5, help="Number of epochs to train.")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
+    parser.add_argument("--base_channels", type=int, default=32, help="Number of base channels in the model.")
+    parser.add_argument("--num_images", type=int, default=8, help="Number of images to visualize.")
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = EncoderDecoderNet(input_channels=1, output_channels=1, base_channels=32).to(device)
+    model = EncoderDecoderNet(
+        input_channels=1,
+        output_channels=1,
+        base_channels=args.base_channels
+    ).to(device)
 
     # 1. Train the model
     print("Training the autoencoder...")
-    train_autoencoder(model, device, epochs=5, batch_size=64, lr=1e-3)
+    train_autoencoder(model, device, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
 
     # 2. Compute SSIM on the test set
     print("Evaluating SSIM on test set...")
-    avg_ssim = compute_ssim(model, device, batch_size=64)
+    avg_ssim = compute_ssim(model, device, batch_size=args.batch_size)
     print(f"Average SSIM on MNIST test set: {avg_ssim:.4f}")
 
     # 3. Show original vs decoded images
-    show_original_decoded(model, device, num_images=8)
+    show_original_decoded(model, device, num_images=args.num_images)
+

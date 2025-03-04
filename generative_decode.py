@@ -228,6 +228,9 @@ def show_original_decoded(model, device, num_images=8):
     plt.tight_layout()
     plt.show()
 
+    plt.savefig("decoded_comparison.png")
+
+
 # -------------------------------
 # 3) Main Script
 # -------------------------------

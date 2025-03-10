@@ -8,6 +8,7 @@ from torchvision.datasets import MNIST
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim as ssim_func
+import psutil  # For CPU memory tracking
 
 # -------------------------------
 # 1) Define the Model
@@ -230,6 +231,58 @@ def show_original_decoded(model, device, num_images=8):
     print("Plot saved as decoded_comparison.png")
 
 # -------------------------------
+# Memory Tracking Utilities
+# -------------------------------
+
+def get_model_memory(model):
+    """Calculate memory used by model parameters."""
+    total_params = sum(p.numel() for p in model.parameters())
+    total_memory = sum(p.element_size() * p.numel() for p in model.parameters())
+    print(f"Total Model Parameters: {total_params}")
+    print(f"Total Model Memory Usage: {total_memory / 1024**2:.2f} MB")
+
+def get_gpu_memory_usage():
+    """Display current and maximum GPU memory usage (if CUDA is available)."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**2
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**2
+        print(f"Current Allocated GPU Memory: {allocated:.2f} MB")
+        print(f"Max Allocated GPU Memory: {max_allocated:.2f} MB")
+    else:
+        print("CUDA is not available.")
+
+def get_cpu_memory_usage():
+    """Display the current process CPU memory usage."""
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    print(f"Current Process Memory Usage: {mem_info.rss / 1024**2:.2f} MB")
+
+def get_activation_memory(model, input_shape=(1, 1, 28, 28)):
+    """
+    Estimate memory used by activations during a forward pass.
+    Note: This only tracks layers that are instances of common modules.
+    """
+    input_tensor = torch.randn(input_shape).to(next(model.parameters()).device)
+    activation_mem = 0
+
+    def hook_fn(module, inp, output):
+        nonlocal activation_mem
+        activation_mem += output.element_size() * output.numel()
+
+    hooks = []
+    for layer in model.modules():
+        if isinstance(layer, (nn.Conv2d, nn.ReLU, nn.MaxPool2d, nn.BatchNorm2d, nn.Linear)):
+            hooks.append(layer.register_forward_hook(hook_fn))
+
+    with torch.no_grad():
+        model(input_tensor)
+
+    for h in hooks:
+        h.remove()
+
+    print(f"Total Activation Memory: {activation_mem / 1024**2:.2f} MB")
+
+# -------------------------------
 # 3) Main Script with argparse
 # -------------------------------
 if __name__ == "__main__":
@@ -248,12 +301,27 @@ if __name__ == "__main__":
         base_channels=args.base_channels
     ).to(device)
 
+    # --- Memory Tracking Before Training ---
+    print("=== Memory Usage Before Training ===")
+    get_model_memory(model)
+    get_cpu_memory_usage()
+    get_gpu_memory_usage()
+    get_activation_memory(model)
+
     # 1. Train the model
-    print("Training the autoencoder...")
+    print("\nTraining the autoencoder...")
     train_autoencoder(model, device, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
 
+    # --- Memory Tracking After Training ---
+    print("\n=== Memory Usage After Training ===")
+    get_model_memory(model)
+    get_cpu_memory_usage()
+    get_gpu_memory_usage()
+    # Optionally, you can check activation memory again:
+    get_activation_memory(model)
+
     # 2. Compute SSIM on the test set
-    print("Evaluating SSIM on test set...")
+    print("\nEvaluating SSIM on test set...")
     avg_ssim = compute_ssim(model, device, batch_size=args.batch_size)
     print(f"Average SSIM on MNIST test set: {avg_ssim:.4f}")
 

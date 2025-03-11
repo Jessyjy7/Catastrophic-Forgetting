@@ -10,8 +10,9 @@ import matplotlib.pyplot as plt
 from pytorch_msssim import ssim as ssim_func
 import psutil  # For CPU memory tracking
 
+
 # -------------------------------
-# 1) Define the Model
+# 1) Define Model Components
 # -------------------------------
 
 class ResidualBlock(nn.Module):
@@ -53,25 +54,35 @@ class EncoderBlock(nn.Module):
             nn.ReLU(inplace=True),
             ResidualBlock(out_channels)
         )
-        self.pool = nn.MaxPool2d(2)
-        
+        self.pool = nn.MaxPool2d(2)  # halves the spatial dimension
+
     def forward(self, x):
         x = self.conv(x)
         p = self.pool(x)
-        return x, p  # skip connection (x) and pooled output (p)
+        return x, p  # 'x' for skip connection, 'p' for pooled output
 
 class DecoderBlock(nn.Module):
     """
     Single decoder block:
     Upsample -> ResidualBlock -> Attention -> Concatenate skip -> Conv.
+
+    Allows a custom 'upsample_layer' if you need something other than the default
+    2x2 stride=2 transposed convolution.
     """
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, upsample_layer=None):
         super(DecoderBlock, self).__init__()
-        self.upsample = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        # If no custom upsample layer is given, default to a 2x2 stride=2 transpose conv
+        if upsample_layer is None:
+            self.upsample = nn.ConvTranspose2d(
+                in_channels, out_channels, kernel_size=2, stride=2
+            )
+        else:
+            self.upsample = upsample_layer
+
         self.res_block = ResidualBlock(out_channels)
         self.attn = AttentionBlock(out_channels)
         self.conv = nn.Conv2d(out_channels * 2, out_channels, kernel_size=3, padding=1)
-        
+
     def forward(self, x, skip):
         x = self.upsample(x)
         x = self.res_block(x)
@@ -80,10 +91,14 @@ class DecoderBlock(nn.Module):
         x = F.relu(self.conv(x))
         return x
 
+# -------------------------------
+# 2) 3-Level U-Net (28->14->7->3)
+# -------------------------------
+
 class EncoderDecoderNet(nn.Module):
     """
     A 3-level U-Net–style network for 28×28 MNIST images,
-    compressing the spatial dimensions down to 3×3 in the deepest part.
+    compressing the spatial dimensions down to 3×3 at the deepest part.
     """
     def __init__(self, input_channels=1, output_channels=1, base_channels=32):
         super(EncoderDecoderNet, self).__init__()
@@ -102,27 +117,37 @@ class EncoderDecoderNet(nn.Module):
         )
         
         # ---------- Decoder ----------
-        # dec3: 3->7 (custom transposed conv)
+        # dec3: 3->7 (requires custom transposed conv for 3->7)
         custom_upsample_3to7 = nn.ConvTranspose2d(
             in_channels=base_channels * 8,
             out_channels=base_channels * 4,
-            kernel_size=4,     # must be 4 to handle 3->7
+            kernel_size=4,
             stride=2,
             padding=1,
-            output_padding=1   # ensures 3->(6+1)=7
+            output_padding=1
         )
-        self.dec3 = DecoderBlock(base_channels * 8, base_channels * 4, upsample_layer=custom_upsample_3to7)
+        self.dec3 = DecoderBlock(
+            in_channels=base_channels * 8,
+            out_channels=base_channels * 4,
+            upsample_layer=custom_upsample_3to7
+        )
         
-        # dec2: 7->14 (standard 2x2)
-        self.dec2 = DecoderBlock(base_channels * 4, base_channels * 2)
+        # dec2: 7->14 (standard 2x2 upsample)
+        self.dec2 = DecoderBlock(
+            in_channels=base_channels * 4,
+            out_channels=base_channels * 2
+        )
         
-        # dec1: 14->28 (standard 2x2)
-        self.dec1 = DecoderBlock(base_channels * 2, base_channels)
+        # dec1: 14->28 (standard 2x2 upsample)
+        self.dec1 = DecoderBlock(
+            in_channels=base_channels * 2,
+            out_channels=base_channels
+        )
         
         self.final_conv = nn.Conv2d(base_channels, output_channels, kernel_size=1)
-        
+
     def forward(self, x):
-        # ---------- Encoder path with skip connections ----------
+        # ---------- Encoder Path ----------
         s1, p1 = self.enc1(x)    # (N, base_channels,   14,14)
         s2, p2 = self.enc2(p1)   # (N, base_channels*2, 7,7)
         s3, p3 = self.enc3(p2)   # (N, base_channels*4, 3,3)
@@ -130,12 +155,12 @@ class EncoderDecoderNet(nn.Module):
         # ---------- Bottleneck ----------
         bn = self.bottleneck(p3) # (N, base_channels*8, 3,3)
         
-        # ---------- Decoder path ----------
+        # ---------- Decoder Path ----------
         d3 = self.dec3(bn, s3)   # 3->7
         d2 = self.dec2(d3, s2)   # 7->14
         d1 = self.dec1(d2, s1)   # 14->28
         
-        out = self.final_conv(d1)
+        out = self.final_conv(d1)  # (N, output_channels, 28,28)
         return out
 
 # -------------------------------

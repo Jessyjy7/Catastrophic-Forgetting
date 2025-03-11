@@ -100,67 +100,52 @@ class EncoderDecoderNet(nn.Module):
     A 3-level U-Net–style network for 28×28 MNIST images,
     compressing the spatial dimensions down to 3×3 at the deepest part.
     """
-    def __init__(self, input_channels=1, output_channels=1, base_channels=32):
-        super(EncoderDecoderNet, self).__init__()
+    def __init__(self, input_channels=1, output_channels=1, base_channels=16):
+        super(SmallEncoderDecoderNet, self).__init__()
         
-        # ---------- Encoder ----------
-        self.enc1 = EncoderBlock(input_channels, base_channels)          # 28 -> 14
-        self.enc2 = EncoderBlock(base_channels, base_channels * 2)       # 14 -> 7
-        self.enc3 = EncoderBlock(base_channels * 2, base_channels * 4)   # 7 -> 3
+        # --- Encoder ---
+        self.enc1 = EncoderBlock(input_channels, base_channels)   # 28->14
+        # Instead of doubling channels, keep the same:
+        self.enc2 = EncoderBlock(base_channels, base_channels)    # 14->7
+        self.enc3 = EncoderBlock(base_channels, base_channels)    # 7->3
 
-        # ---------- Bottleneck ----------
+        # --- Bottleneck ---
         self.bottleneck = nn.Sequential(
-            nn.Conv2d(base_channels * 4, base_channels * 8, kernel_size=3, padding=1),
-            nn.BatchNorm2d(base_channels * 8),
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels),
             nn.ReLU(inplace=True),
-            ResidualBlock(base_channels * 8)
+            ResidualBlock(base_channels)  # optional
         )
         
-        # ---------- Decoder ----------
-        # dec3: 3->7 (requires custom transposed conv for 3->7)
+        # --- Decoder ---
+        # 3->7 with a custom upsample to match the 3->7 shape
         custom_upsample_3to7 = nn.ConvTranspose2d(
-            in_channels=base_channels * 8,
-            out_channels=base_channels * 4,
+            in_channels=base_channels,
+            out_channels=base_channels,
             kernel_size=4,
             stride=2,
             padding=1,
             output_padding=1
         )
-        self.dec3 = DecoderBlock(
-            in_channels=base_channels * 8,
-            out_channels=base_channels * 4,
-            upsample_layer=custom_upsample_3to7
-        )
+        self.dec3 = DecoderBlock(base_channels, base_channels, upsample_layer=custom_upsample_3to7)
         
-        # dec2: 7->14 (standard 2x2 upsample)
-        self.dec2 = DecoderBlock(
-            in_channels=base_channels * 4,
-            out_channels=base_channels * 2
-        )
-        
-        # dec1: 14->28 (standard 2x2 upsample)
-        self.dec1 = DecoderBlock(
-            in_channels=base_channels * 2,
-            out_channels=base_channels
-        )
+        self.dec2 = DecoderBlock(base_channels, base_channels)  # 7->14
+        self.dec1 = DecoderBlock(base_channels, base_channels)  # 14->28
         
         self.final_conv = nn.Conv2d(base_channels, output_channels, kernel_size=1)
 
     def forward(self, x):
-        # ---------- Encoder Path ----------
-        s1, p1 = self.enc1(x)    # (N, base_channels,   14,14)
-        s2, p2 = self.enc2(p1)   # (N, base_channels*2, 7,7)
-        s3, p3 = self.enc3(p2)   # (N, base_channels*4, 3,3)
+        s1, p1 = self.enc1(x)
+        s2, p2 = self.enc2(p1)
+        s3, p3 = self.enc3(p2)
         
-        # ---------- Bottleneck ----------
-        bn = self.bottleneck(p3) # (N, base_channels*8, 3,3)
+        bn = self.bottleneck(p3)
         
-        # ---------- Decoder Path ----------
-        d3 = self.dec3(bn, s3)   # 3->7
-        d2 = self.dec2(d3, s2)   # 7->14
-        d1 = self.dec1(d2, s1)   # 14->28
+        d3 = self.dec3(bn, s3)
+        d2 = self.dec2(d3, s2)
+        d1 = self.dec1(d2, s1)
         
-        out = self.final_conv(d1)  # (N, output_channels, 28,28)
+        out = self.final_conv(d1)
         return out
 
 # -------------------------------

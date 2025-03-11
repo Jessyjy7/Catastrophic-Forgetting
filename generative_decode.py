@@ -82,42 +82,48 @@ class DecoderBlock(nn.Module):
 
 class EncoderDecoderNet(nn.Module):
     """
-    A 2-level U-Net–style network tailored for 28×28 MNIST images.
+    A 3-level U-Net–style network for 28×28 MNIST images,
+    compressing the spatial dimensions down to 3×3 in the deepest part.
     """
     def __init__(self, input_channels=1, output_channels=1, base_channels=32):
         super(EncoderDecoderNet, self).__init__()
         
         # ---------- Encoder ----------
-        self.enc1 = EncoderBlock(input_channels, base_channels)        # 28 -> 14
-        self.enc2 = EncoderBlock(base_channels, base_channels * 2)     # 14 -> 7
-        
+        self.enc1 = EncoderBlock(input_channels, base_channels)          # 28 -> 14
+        self.enc2 = EncoderBlock(base_channels, base_channels * 2)       # 14 -> 7
+        self.enc3 = EncoderBlock(base_channels * 2, base_channels * 4)   # 7 -> 3
+
         # ---------- Bottleneck ----------
+        # We'll double the channels again (base_channels*4 -> base_channels*8)
         self.bottleneck = nn.Sequential(
-            nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=3, padding=1),
-            nn.BatchNorm2d(base_channels * 4),
+            nn.Conv2d(base_channels * 4, base_channels * 8, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels * 8),
             nn.ReLU(inplace=True),
-            ResidualBlock(base_channels * 4)
+            ResidualBlock(base_channels * 8)
         )
         
         # ---------- Decoder ----------
-        self.dec2 = DecoderBlock(base_channels * 4, base_channels * 2)  # 7 -> 14
-        self.dec1 = DecoderBlock(base_channels * 2, base_channels)      # 14 -> 28
+        self.dec3 = DecoderBlock(base_channels * 8, base_channels * 4)    # 3 -> 7
+        self.dec2 = DecoderBlock(base_channels * 4, base_channels * 2)    # 7 -> 14
+        self.dec1 = DecoderBlock(base_channels * 2, base_channels)        # 14 -> 28
         
         self.final_conv = nn.Conv2d(base_channels, output_channels, kernel_size=1)
         
     def forward(self, x):
-        # Encoder path with skip connections
-        s1, p1 = self.enc1(x)  
-        s2, p2 = self.enc2(p1)
+        # ---------- Encoder path with skip connections ----------
+        s1, p1 = self.enc1(x)    # (N, base_channels,   14, 14)
+        s2, p2 = self.enc2(p1)   # (N, base_channels*2, 7, 7)
+        s3, p3 = self.enc3(p2)   # (N, base_channels*4, 3, 3)
         
-        # Bottleneck
-        bn = self.bottleneck(p2)
+        # ---------- Bottleneck ----------
+        bn = self.bottleneck(p3) # (N, base_channels*8, 3, 3)
         
-        # Decoder path
-        d2 = self.dec2(bn, s2)
-        d1 = self.dec1(d2, s1)
+        # ---------- Decoder path ----------
+        d3 = self.dec3(bn, s3)   # 3 -> 7
+        d2 = self.dec2(d3, s2)   # 7 -> 14
+        d1 = self.dec1(d2, s1)   # 14 -> 28
         
-        out = self.final_conv(d1)
+        out = self.final_conv(d1)  # (N, output_channels, 28, 28)
         return out
 
 # -------------------------------

@@ -101,7 +101,7 @@ class EncoderDecoderNet(nn.Module):
     compressing the spatial dimensions down to 3×3 at the deepest part.
     """
     def __init__(self, input_channels=1, output_channels=1, base_channels=16):
-        super(SmallEncoderDecoderNet, self).__init__()
+        super(EncoderDecoderNet, self).__init__()
         
         # --- Encoder ---
         self.enc1 = EncoderBlock(input_channels, base_channels)   # 28->14

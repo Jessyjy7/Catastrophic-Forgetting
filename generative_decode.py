@@ -94,7 +94,6 @@ class EncoderDecoderNet(nn.Module):
         self.enc3 = EncoderBlock(base_channels * 2, base_channels * 4)   # 7 -> 3
 
         # ---------- Bottleneck ----------
-        # We'll double the channels again (base_channels*4 -> base_channels*8)
         self.bottleneck = nn.Sequential(
             nn.Conv2d(base_channels * 4, base_channels * 8, kernel_size=3, padding=1),
             nn.BatchNorm2d(base_channels * 8),
@@ -103,27 +102,40 @@ class EncoderDecoderNet(nn.Module):
         )
         
         # ---------- Decoder ----------
-        self.dec3 = DecoderBlock(base_channels * 8, base_channels * 4)    # 3 -> 7
-        self.dec2 = DecoderBlock(base_channels * 4, base_channels * 2)    # 7 -> 14
-        self.dec1 = DecoderBlock(base_channels * 2, base_channels)        # 14 -> 28
+        # dec3: 3->7 (custom transposed conv)
+        custom_upsample_3to7 = nn.ConvTranspose2d(
+            in_channels=base_channels * 8,
+            out_channels=base_channels * 4,
+            kernel_size=4,     # must be 4 to handle 3->7
+            stride=2,
+            padding=1,
+            output_padding=1   # ensures 3->(6+1)=7
+        )
+        self.dec3 = DecoderBlock(base_channels * 8, base_channels * 4, upsample_layer=custom_upsample_3to7)
+        
+        # dec2: 7->14 (standard 2x2)
+        self.dec2 = DecoderBlock(base_channels * 4, base_channels * 2)
+        
+        # dec1: 14->28 (standard 2x2)
+        self.dec1 = DecoderBlock(base_channels * 2, base_channels)
         
         self.final_conv = nn.Conv2d(base_channels, output_channels, kernel_size=1)
         
     def forward(self, x):
         # ---------- Encoder path with skip connections ----------
-        s1, p1 = self.enc1(x)    # (N, base_channels,   14, 14)
-        s2, p2 = self.enc2(p1)   # (N, base_channels*2, 7, 7)
-        s3, p3 = self.enc3(p2)   # (N, base_channels*4, 3, 3)
+        s1, p1 = self.enc1(x)    # (N, base_channels,   14,14)
+        s2, p2 = self.enc2(p1)   # (N, base_channels*2, 7,7)
+        s3, p3 = self.enc3(p2)   # (N, base_channels*4, 3,3)
         
         # ---------- Bottleneck ----------
-        bn = self.bottleneck(p3) # (N, base_channels*8, 3, 3)
+        bn = self.bottleneck(p3) # (N, base_channels*8, 3,3)
         
         # ---------- Decoder path ----------
-        d3 = self.dec3(bn, s3)   # 3 -> 7
-        d2 = self.dec2(d3, s2)   # 7 -> 14
-        d1 = self.dec1(d2, s1)   # 14 -> 28
+        d3 = self.dec3(bn, s3)   # 3->7
+        d2 = self.dec2(d3, s2)   # 7->14
+        d1 = self.dec1(d2, s1)   # 14->28
         
-        out = self.final_conv(d1)  # (N, output_channels, 28, 28)
+        out = self.final_conv(d1)
         return out
 
 # -------------------------------

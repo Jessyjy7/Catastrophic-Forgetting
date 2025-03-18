@@ -233,7 +233,7 @@ def sequential_train_with_buffer_using_decoded(model, device, criterion, optimiz
 
     # 1. Load the decoded replay buffer
     # e.g., "decoded_buffer_MNIST.pt", "decoded_buffer_CIFAR10.pt", etc.
-    buffer_file = "decoded_buffer_MNIST.pt"  # or adapt if you store differently
+    buffer_file = "../../decoded_buffer_MNIST.pt"  # or adapt if you store differently
     decoded_buffer = torch.load(buffer_file)
     print(f"Loaded {len(decoded_buffer)} decoded samples from {buffer_file}")
 

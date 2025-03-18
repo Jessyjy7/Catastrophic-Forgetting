@@ -3,14 +3,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset, TensorDataset
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim as ssim_func
 import psutil
+import os
 
 # If Flowers102 is not in your torchvision, you may need a newer version:
-# from torchvision.datasets import Flowers102
 from torchvision.datasets import MNIST, CIFAR10
 
 ###############################################################################
@@ -61,7 +61,7 @@ def get_dataloaders(dataset_name, batch_size):
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False)
-    return train_loader, test_loader, in_channels, (height, width)
+    return train_loader, test_loader, train_dataset, in_channels, (height, width)
 
 ###############################################################################
 # 2) Utility to Determine Number of Downsampling Levels
@@ -74,8 +74,8 @@ def calc_num_levels(height, width, min_size=4):
     which is 3 levels if min_size=4 (since 3 < 4).
     If H=W=32, we get:
       32->16->8->4
-    which is 3 levels if min_size=4 (4 is == min_size, so we stop).
-    If H=W=64, we get 64->32->16->8->4->2 (5 levels if min_size=2, or 4 levels if min_size=4).
+    which is 3 levels if min_size=4 (4 == min_size, so we stop).
+    If H=W=64, we get 64->32->16->8->4->2, etc.
     """
     levels = 0
     while height >= min_size*2 and width >= min_size*2:
@@ -167,11 +167,7 @@ class DynamicUNet(nn.Module):
         for lvl in range(num_levels):
             enc_block = EncoderBlock(c_in, c_out)
             self.encoders.append(enc_block)
-            # Optionally keep c_out the same or double it each time:
-            # c_in = c_out
-            # c_out *= 2
-            # For simplicity, let's keep them the same:
-            c_in = c_out
+            c_in = c_out  # keeping same channel count
 
         # Bottleneck
         self.bottleneck = nn.Sequential(
@@ -202,7 +198,7 @@ class DynamicUNet(nn.Module):
 
         # Decoder path (reverse the skip list)
         for i, dec in enumerate(self.decoders):
-            skip = skips[-(i+1)]  # from the end
+            skip = skips[-(i+1)]
             out = dec(out, skip)
 
         out = self.final_conv(out)
@@ -212,12 +208,6 @@ class DynamicUNet(nn.Module):
 # 5) Build a model for each dataset
 ###############################################################################
 def build_model_for_dataset(dataset_name, in_channels, height, width, base_channels=16):
-    """
-    1) Compute how many levels we can do with 2x2 pooling.
-    2) Build a DynamicUNet with that many levels.
-    3) Return the model.
-    """
-    # Decide a min_size. E.g., if we don't want to go below 4x4
     min_size = 4
     num_levels = calc_num_levels(height, width, min_size=min_size)
     print(f"Dataset {dataset_name}: image size {height}x{width}, -> building {num_levels} levels U-Net")
@@ -279,7 +269,6 @@ def show_original_decoded(model, device, test_loader, num_images=8, in_channels=
     fig, axes = plt.subplots(2, num_images, figsize=(2*num_images, 4))
     for i in range(num_images):
         if in_channels == 3:
-            # (C,H,W) -> (H,W,C)
             axes[0, i].imshow(images[i].permute(1,2,0).numpy())
             axes[1, i].imshow(decoded[i].permute(1,2,0).numpy())
         else:
@@ -346,7 +335,71 @@ def get_activation_memory(model, in_channels=1, height=28, width=28):
     print(f"Total Activation Memory: {activation_mem / 1024**2:.2f} MB")
 
 ###############################################################################
-# 8) Main Script
+# 8) Create Decoded Replay Buffer
+###############################################################################
+def create_decoded_replay_buffer(model, device, dataset, dataset_name, in_channels, max_per_class=30):
+    """
+    For each class in 'dataset', decode up to 'max_per_class' examples using the autoencoder
+    and store them in a list as (decoded_image, label). Then save to 'decoded_buffer_{dataset_name}.pt'.
+
+    'dataset' can be MNIST, CIFAR-10, or a ConcatDataset for Flowers102.
+    We'll scan 'dataset.targets' or sub-datasets to get labels.
+    """
+    model.eval()
+    # 1) Gather label->indices
+    label_to_indices = {}
+    # Handle ConcatDataset for Flowers102 or direct dataset for MNIST/CIFAR
+    if hasattr(dataset, 'datasets'):  # likely a ConcatDataset
+        # We'll gather labels from sub-datasets
+        offset = 0
+        for subds in dataset.datasets:
+            n_sub = len(subds)
+            # subds should have subds.targets
+            if not hasattr(subds, 'targets'):
+                raise ValueError("Sub-dataset has no 'targets' attribute.")
+            for i in range(n_sub):
+                lbl = int(subds.targets[i])
+                if lbl not in label_to_indices:
+                    label_to_indices[lbl] = []
+                label_to_indices[lbl].append(offset + i)
+            offset += n_sub
+    else:
+        # direct dataset
+        if not hasattr(dataset, 'targets'):
+            raise ValueError("Dataset has no 'targets' attribute.")
+        for i, lbl in enumerate(dataset.targets):
+            lbl = int(lbl)  # ensure int
+            if lbl not in label_to_indices:
+                label_to_indices[lbl] = []
+            label_to_indices[lbl].append(i)
+
+    # 2) For each class, pick up to 'max_per_class' indices
+    decoded_buffer = []
+    from torch.utils.data import DataLoader, Subset
+    for lbl, idxs in label_to_indices.items():
+        if len(idxs) > max_per_class:
+            idxs = idxs[:max_per_class]
+        # Create a small subset/dataloader
+        subset = Subset(dataset, idxs)
+        loader = DataLoader(subset, batch_size=16, shuffle=False)
+        # 3) For each batch, feed into autoencoder, store decoded
+        with torch.no_grad():
+            for images, _ in loader:
+                images = images.to(device)
+                # forward pass
+                decoded = model(images)  # shape [B, in_channels, H, W]
+                decoded = torch.clamp(decoded, 0.0, 1.0).cpu()
+                # store
+                for i in range(decoded.size(0)):
+                    decoded_buffer.append((decoded[i], lbl))
+
+    # 4) Save to disk
+    buffer_filename = f"decoded_buffer_{dataset_name}.pt"
+    torch.save(decoded_buffer, buffer_filename)
+    print(f"Saved decoded replay buffer with {len(decoded_buffer)} samples to {buffer_filename}.")
+
+###############################################################################
+# 9) Main Script
 ###############################################################################
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a U-Net style autoencoder on MNIST, CIFAR10, or FLOWERS102.")
@@ -356,12 +409,13 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
     parser.add_argument("--base_channels", type=int, default=16, help="Number of base channels in the model.")
     parser.add_argument("--num_images", type=int, default=8, help="Number of images to visualize.")
+    parser.add_argument("--max_per_class", type=int, default=30, help="Number of samples to decode per class.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 1) Get data
-    train_loader, test_loader, in_channels, (height, width) = get_dataloaders(args.dataset, args.batch_size)
+    train_loader, test_loader, train_dataset, in_channels, (height, width) = get_dataloaders(args.dataset, args.batch_size)
 
     # 2) Build model dynamically
     model = build_model_for_dataset(
@@ -380,7 +434,7 @@ if __name__ == "__main__":
     get_gpu_memory_usage()
     get_activation_memory(model, in_channels=in_channels, height=height, width=width)
 
-    # 4) Train
+    # 4) Train autoencoder
     print("\nTraining the autoencoder...")
     train_autoencoder(model, device, train_loader, epochs=args.epochs, lr=args.lr)
 
@@ -396,5 +450,14 @@ if __name__ == "__main__":
     avg_ssim = compute_ssim(model, device, test_loader)
     print(f"Average SSIM on {args.dataset} test set: {avg_ssim:.4f}")
 
-    # 7) Visualize
+    # 7) Visualize some reconstructions
     show_original_decoded(model, device, test_loader, num_images=args.num_images, in_channels=in_channels)
+
+    # 8) Create & Save Decoded Replay Buffer
+    print(f"\n=== Creating decoded replay buffer with up to {args.max_per_class} samples per class ===")
+    create_decoded_replay_buffer(
+        model, device, train_dataset, 
+        dataset_name=args.dataset, 
+        in_channels=in_channels, 
+        max_per_class=args.max_per_class
+    )

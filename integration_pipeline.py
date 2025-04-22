@@ -1,4 +1,4 @@
-# hdc_autoencoder_cuda.py
+# hdc_unet_autoencoder.py
 
 import argparse
 import torch
@@ -8,210 +8,308 @@ import torchvision
 import torchvision.transforms as transforms
 import numpy as np
 import matplotlib.pyplot as plt
+
 from hadamardHD import binding, unbinding
 from pytorch_msssim import ssim as ssim_func
 
 ##############################################
-# 1. Simple Autoencoder (same as before)
+# 1) Building Blocks: Residual + Attention
 ##############################################
-class SimpleAutoencoder(nn.Module):
-    def __init__(self, latent_dim):
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(1, 16, 3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, 3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(32 * 7 * 7, latent_dim)
-        )
-        self.decoder_fc = nn.Sequential(
-            nn.Linear(latent_dim, 32 * 7 * 7),
-            nn.ReLU()
-        )
-        self.decoder_conv = nn.Sequential(
-            nn.ConvTranspose2d(32, 16, 3, stride=2, padding=1, output_padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(16, 1, 3, stride=2, padding=1, output_padding=1),
-            nn.Sigmoid()
-        )
-        
-    def encode(self, x):
-        return self.encoder(x)
-    
-    def decode(self, z):
-        x = self.decoder_fc(z)
-        x = x.view(-1, 32, 7, 7)
-        return self.decoder_conv(x)
-    
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.bn1   = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.bn2   = nn.BatchNorm2d(channels)
+
     def forward(self, x):
-        return self.decode(self.encode(x))
+        res = x
+        out = torch.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += res
+        return torch.relu(out)
+
+class AttentionBlock(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, 1, 1)
+    def forward(self, x):
+        w = torch.sigmoid(self.conv(x))
+        return x * w
 
 ##############################################
-# 2. HDC‑Augmented Decoder Training
+# 2) Encoder & Decoder Blocks for U‑Net
 ##############################################
-def train_decoder_with_hdc(model, dataloader, hdc_dim, group_size, epochs, lr, device):
-    # Freeze encoder
-    for p in model.encoder.parameters():
-        p.requires_grad = False
-    model.encoder.eval()
+class EncoderBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            ResidualBlock(out_ch)
+        )
+        self.pool = nn.MaxPool2d(2)
+    def forward(self, x):
+        skip = self.conv(x)
+        down = self.pool(skip)
+        return skip, down
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, 2, stride=2)
+        self.res = ResidualBlock(out_ch)
+        self.att = AttentionBlock(out_ch)
+        self.conv = nn.Conv2d(out_ch*2, out_ch, 3, padding=1)
+    def forward(self, x, skip):
+        x = self.up(x)
+        x = self.res(x)
+        x = self.att(x)
+        x = torch.cat([x, skip], dim=1)
+        return torch.relu(self.conv(x))
+
+##############################################
+# 3) Full U‑Net Autoencoder with Latent Vector
+##############################################
+class UNetAutoencoder(nn.Module):
+    def __init__(self, in_ch, base_ch, latent_dim, height, width):
+        super().__init__()
+        # compute downsampling levels
+        levels = 0
+        h, w = height, width
+        while h >= 8 and w >= 8:
+            h //= 2; w //= 2; levels += 1
+        self.levels = levels
+
+        # encoders
+        self.encoders = nn.ModuleList()
+        ch = base_ch
+        in_c = in_ch
+        for _ in range(levels):
+            self.encoders.append(EncoderBlock(in_c, ch))
+            in_c = ch; ch *= 2
+
+        # bottleneck
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(in_c, in_c, 3, padding=1),
+            nn.BatchNorm2d(in_c),
+            nn.ReLU(inplace=True),
+            ResidualBlock(in_c)
+        )
+
+        # flatten dims for latent
+        self.flat_h, self.flat_w = h, w
+        flat_ch = in_c * h * w
+        self.to_latent   = nn.Linear(flat_ch, latent_dim)
+        self.from_latent = nn.Linear(latent_dim, flat_ch)
+
+        # decoders
+        self.decoders = nn.ModuleList()
+        ch //= 2
+        for _ in range(levels):
+            self.decoders.append(DecoderBlock(in_c, ch))
+            in_c = ch; ch //= 2
+
+        self.final_conv = nn.Conv2d(in_c, in_ch, 1)
+
+    def encode(self, x):
+        skips = []
+        out = x
+        for enc in self.encoders:
+            skip, out = enc(out)
+            skips.append(skip)
+        out = self.bottleneck(out)
+        B, C, H, W = out.shape
+        flat = out.view(B, -1)
+        z    = self.to_latent(flat)
+        return z, skips
+
+    def decode(self, z, skips):
+        B = z.size(0)
+        flat = self.from_latent(z)
+        out = flat.view(B, -1, self.flat_h, self.flat_w)
+        for dec, skip in zip(self.decoders, reversed(skips)):
+            out = dec(out, skip)
+        return torch.sigmoid(self.final_conv(out))
+
+    def forward(self, x):
+        z, skips = self.encode(x)
+        return self.decode(z, skips)
+
+##############################################
+# 4) HDC‑Augmented Decoder Training
+##############################################
+def train_decoder_with_hdc(model, loader, hdc_dim, group_size, epochs, lr, device):
+    # freeze encoder + bottleneck + to_latent
+    for p in model.encoders.parameters():      p.requires_grad = False
+    for p in model.bottleneck.parameters():     p.requires_grad = False
+    for p in model.to_latent.parameters():      p.requires_grad = False
 
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(
-        list(model.decoder_fc.parameters()) + list(model.decoder_conv.parameters()),
+    opt = optim.Adam(
+        list(model.from_latent.parameters()) +
+        list(model.decoders.parameters()) +
+        list(model.final_conv.parameters()),
         lr=lr
     )
-    
-    for epoch in range(1, epochs+1):
-        epoch_loss = 0.0
-        for images, labels in dataloader:
-            images = images.to(device)
-            labels = labels.to(device)
-            
-            # encode & detach
+
+    for ep in range(1, epochs+1):
+        total_loss = 0.0
+        for imgs, labels in loader:
+            imgs  = imgs.to(device)
+            labels= labels.to(device)
+
+            # encode once
             with torch.no_grad():
-                z_clean = model.encode(images)  # [B, latent_dim]
-            z_np = z_clean.cpu().numpy()
-            labels_np = labels.cpu().numpy()
-            latent_dim = z_np.shape[1]
-            
+                z_clean, skips = model.encode(imgs)
+            z_np  = z_clean.cpu().numpy()
+            labs  = labels.cpu().numpy()
+            ld    = z_np.shape[1]
+
             # pick a class with enough samples
-            unique, counts = np.unique(labels_np, return_counts=True)
-            valid = unique[counts >= group_size]
-            if len(valid) == 0:
-                continue
+            u, cts = np.unique(labs, return_counts=True)
+            valid  = u[cts >= group_size]
+            if len(valid)==0: continue
             cls = np.random.choice(valid)
-            
-            idxs = np.where(labels_np == cls)[0]
-            sel = np.random.choice(idxs, group_size, replace=False)
-            selected = z_np[sel]
-            
+            idxs = np.where(labs==cls)[0]
+            sel  = np.random.choice(idxs, group_size, False)
+            group= z_np[sel]
+
             # bind & bundle
             bound = []
-            for i, vec in enumerate(selected):
-                v = vec
-                if latent_dim < hdc_dim:
-                    v = np.pad(v, (0, hdc_dim - latent_dim), 'constant')
-                else:
-                    v = v[:hdc_dim]
-                bound.append(binding(hdc_dim, i, v))
+            for i, v in enumerate(group):
+                vec = v if ld>=hdc_dim else np.pad(v, (0,hdc_dim-ld), 'constant')
+                bound.append(binding(hdc_dim, i, vec))
             bundle = np.sum(bound, axis=0)
-            
+
             # unbind
             recs = []
             for i in range(group_size):
-                u = unbinding(hdc_dim, i, bundle)
-                recs.append(u[:latent_dim])
+                uvec = unbinding(hdc_dim, i, bundle)
+                recs.append(uvec[:ld])
             z_noisy = torch.tensor(np.stack(recs), dtype=torch.float32, device=device)
-            
+
+            # slice skips to match sel
+            new_skips = [skip_tensor[sel] for skip_tensor in skips]
+
             # decode & loss
-            outputs = model.decode(z_noisy)
-            target = images[sel]
-            loss = criterion(outputs, target)
-            
-            optimizer.zero_grad()
+            dec = model.decode(z_noisy, new_skips)
+            tgt = imgs[sel]
+            loss = criterion(dec, tgt)
+
+            opt.zero_grad()
             loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-        
-        avg = epoch_loss / len(dataloader)
-        print(f"[Epoch {epoch}/{epochs}] HDC‑train loss: {avg:.4f}")
+            opt.step()
+            total_loss += loss.item()
+
+        avg = total_loss / len(loader)
+        print(f"[Epoch {ep}/{epochs}] HDC‑train loss: {avg:.4f}")
 
 ##############################################
-# 3. Integration + SSIM + Save Plot
+# 5) Integration + SSIM + Save
 ##############################################
-def integration_pipeline(model, dataloader, hdc_dim, num_samples, device, out_path):
+def integration_pipeline(model, loader, hdc_dim, num_samples, device, out_path):
     model.eval()
-    images, _ = next(iter(dataloader))
-    images = images.to(device)[:num_samples]
-    
-    # encode
+    imgs, _ = next(iter(loader))
+    imgs = imgs.to(device)[:num_samples]
+
     with torch.no_grad():
-        z = model.encode(images).cpu().numpy()
-    latent_dim = z.shape[1]
-    
-    # bind & bundle
+        z, skips = model.encode(imgs)
+    z_np = z.cpu().numpy()
+    ld   = z_np.shape[1]
+
+    # bind & bundle all num_samples
     bound = []
     for i in range(num_samples):
-        v = z[i]
-        if latent_dim < hdc_dim:
-            v = np.pad(v, (0, hdc_dim - latent_dim), 'constant')
-        hv = binding(hdc_dim, i, v)
-        bound.append(hv)
+        v = z_np[i]
+        vec = v if ld>=hdc_dim else np.pad(v, (0,hdc_dim-ld), 'constant')
+        bound.append(binding(hdc_dim, i, vec))
     bundle = np.sum(bound, axis=0)
-    
+
     # unbind
     recs = []
     for i in range(num_samples):
-        u = unbinding(hdc_dim, i, bundle)
-        recs.append(u[:latent_dim])
+        uvec = unbinding(hdc_dim, i, bundle)
+        recs.append(uvec[:ld])
     z_rec = torch.tensor(np.stack(recs), dtype=torch.float32, device=device)
-    
-    # decode + SSIM
+
+    # slice skips for test set
+    new_skips = [skip_tensor[:num_samples] for skip_tensor in skips]
+
     with torch.no_grad():
-        dec = model.decode(z_rec)
-        s = ssim_func(images, dec, data_range=1.0, size_average=True)
+        dec = model.decode(z_rec, new_skips)
+        s   = ssim_func(imgs, dec, data_range=1.0, size_average=True)
     print(f"Test SSIM: {s.item():.4f}")
-    
-    # save comparison plot
-    imgs = images.cpu().numpy()
-    decs = dec.cpu().numpy()
-    fig, axs = plt.subplots(2, num_samples, figsize=(2*num_samples, 4))
+
+    # save plot
+    o = imgs.cpu().numpy()
+    d = dec.cpu().numpy()
+    fig, ax = plt.subplots(2, num_samples, figsize=(2*num_samples, 4))
     for i in range(num_samples):
-        axs[0,i].imshow(imgs[i].squeeze(), cmap='gray'); axs[0,i].axis('off')
-        axs[1,i].imshow(decs[i].squeeze(), cmap='gray'); axs[1,i].axis('off')
-    axs[0,0].set_title("Original")
-    axs[1,0].set_title("Decoded")
+        ax[0,i].imshow(o[i].squeeze(), cmap='gray'); ax[0,i].axis('off')
+        ax[1,i].imshow(d[i].squeeze(), cmap='gray'); ax[1,i].axis('off')
+    ax[0,0].set_title("Original"); ax[1,0].set_title("Decoded")
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
-    print(f"Saved reconstruction plot to {out_path}")
+    print(f"Saved plot to {out_path}")
 
 ##############################################
-# 4. Main & Argparse
+# 6) Main & Args
 ##############################################
 def main():
-    p = argparse.ArgumentParser(description="HDC‑Autoencoder on MNIST (CUDA enabled)")
-    p.add_argument("--latent_dim",  type=int,   default=2048)
-    p.add_argument("--hdc_dim",     type=int,   default=2048)
-    p.add_argument("--group_size",  type=int,   default=10)
-    p.add_argument("--epochs",      type=int,   default=15)
-    p.add_argument("--batch_size",  type=int,   default=64)
-    p.add_argument("--lr",          type=float, default=1e-3)
-    p.add_argument("--num_samples", type=int,   default=10)
+    p = argparse.ArgumentParser()
+    p.add_argument("--latent_dim",  type=int, default=2048,
+                   help="latent and HDC dimension (must match)")
+    p.add_argument("--base_ch",     type=int, default=16,
+                   help="base number of channels in U‑Net")
+    p.add_argument("--group_size",  type=int, default=10,
+                   help="how many latents to bundle each HDC training step")
+    p.add_argument("--epochs",      type=int, default=5,
+                   help="HDC training epochs")
+    p.add_argument("--batch_size",  type=int, default=64,
+                   help="MNIST dataloader batch size")
+    p.add_argument("--lr",          type=float, default=1e-3,
+                   help="learning rate for HDC decoder training")
+    p.add_argument("--num_samples", type=int, default=10,
+                   help="samples in final integration test")
     p.add_argument("--out_path",    type=str,   default="reconstruction.png",
                    help="where to save the final comparison plot")
     args = p.parse_args()
 
+    assert args.latent_dim > 0, "latent_dim must be positive"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
+    print("Running on", device)
 
-    # Data loader
+    # Data
     transform = transforms.ToTensor()
-    mnist = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-    loader = torch.utils.data.DataLoader(mnist, batch_size=args.batch_size, shuffle=True)
+    ds = torchvision.datasets.MNIST(root="./data", train=True, download=True, transform=transform)
+    loader = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, shuffle=True)
 
     # Model
-    model = SimpleAutoencoder(latent_dim=args.latent_dim).to(device)
+    latent_dim = args.latent_dim
+    model = UNetAutoencoder(1, args.base_ch, latent_dim, height=28, width=28).to(device)
 
-    # 1) Train decoder with HDC noise
-    print("→ Training decoder with HDC noise…")
+    # HDC‑augmented decoder training
+    print("→ Starting HDC‑augmented decoder training …")
     train_decoder_with_hdc(
         model, loader,
-        hdc_dim=args.hdc_dim,
-        group_size=args.group_size,
-        epochs=args.epochs,
-        lr=args.lr,
-        device=device
+        hdc_dim    = latent_dim,
+        group_size = args.group_size,
+        epochs     = args.epochs,
+        lr         = args.lr,
+        device     = device
     )
 
-    # 2) Integration + SSIM + save plot
-    print("→ Running integration pipeline…")
+    # Integration + SSIM + save
+    print("→ Running integration pipeline …")
     integration_pipeline(
         model, loader,
-        hdc_dim=args.hdc_dim,
-        num_samples=args.num_samples,
-        device=device,
-        out_path=args.out_path
+        hdc_dim     = latent_dim,
+        num_samples = args.num_samples,
+        device      = device,
+        out_path    = args.out_path
     )
 
 if __name__ == "__main__":

@@ -1,19 +1,33 @@
-# hdc_unet_autoencoder.py
-
 import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
-import numpy as np
 import matplotlib.pyplot as plt
-
-from hadamardHD import binding, unbinding
+import torch.nn.functional as F
 from pytorch_msssim import ssim as ssim_func
 
 ##############################################
-# 1) Building Blocks: Residual + Attention
+# helper: build a power-of-2 Hadamard on GPU
+##############################################
+def generate_hadamard(n: int, device: torch.device) -> torch.Tensor:
+    """
+    Sylvester’s construction of an n×n Hadamard matrix,
+    with entries ±1. Requires n to be a power of 2.
+    """
+    assert n > 0 and (n & (n-1)) == 0, "hdc_dim must be power-of-two"
+    H = torch.tensor([[1.]], dtype=torch.float32, device=device)
+    while H.shape[0] < n:
+        H = torch.cat([
+            torch.cat([H,  H], dim=1),
+            torch.cat([H, -H], dim=1),
+        ], dim=0)
+    return H  # shape [n,n]
+
+##############################################
+# (your U-Net / Residual / Attention blocks)
+# ———————— UNCHANGED ————————
 ##############################################
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
@@ -25,22 +39,19 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x):
         res = x
-        out = torch.relu(self.bn1(self.conv1(x)))
+        out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out += res
-        return torch.relu(out)
+        return F.relu(out)
 
 class AttentionBlock(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, 1, 1)
-    def forward(self, x):
-        w = torch.sigmoid(self.conv(x))
-        return x * w
 
-##############################################
-# 2) Encoder & Decoder Blocks for U‑Net
-##############################################
+    def forward(self, x):
+        return x * torch.sigmoid(self.conv(x))
+
 class EncoderBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -59,39 +70,32 @@ class EncoderBlock(nn.Module):
 class DecoderBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.up = nn.ConvTranspose2d(in_ch, out_ch, 2, stride=2)
-        self.res = ResidualBlock(out_ch)
-        self.att = AttentionBlock(out_ch)
+        self.up   = nn.ConvTranspose2d(in_ch, out_ch, 2, stride=2)
+        self.res  = ResidualBlock(out_ch)
+        self.att  = AttentionBlock(out_ch)
         self.conv = nn.Conv2d(out_ch*2, out_ch, 3, padding=1)
     def forward(self, x, skip):
         x = self.up(x)
         x = self.res(x)
         x = self.att(x)
         x = torch.cat([x, skip], dim=1)
-        return torch.relu(self.conv(x))
+        return F.relu(self.conv(x))
 
-##############################################
-# 3) Full U‑Net Autoencoder with Latent Vector
-##############################################
 class UNetAutoencoder(nn.Module):
     def __init__(self, in_ch, base_ch, latent_dim, height, width):
         super().__init__()
-        # compute downsampling levels
         levels = 0
         h, w = height, width
         while h >= 8 and w >= 8:
             h //= 2; w //= 2; levels += 1
         self.levels = levels
 
-        # encoders
         self.encoders = nn.ModuleList()
-        ch = base_ch
-        in_c = in_ch
+        ch = base_ch; in_c = in_ch
         for _ in range(levels):
             self.encoders.append(EncoderBlock(in_c, ch))
             in_c = ch; ch *= 2
 
-        # bottleneck
         self.bottleneck = nn.Sequential(
             nn.Conv2d(in_c, in_c, 3, padding=1),
             nn.BatchNorm2d(in_c),
@@ -99,13 +103,11 @@ class UNetAutoencoder(nn.Module):
             ResidualBlock(in_c)
         )
 
-        # flatten dims for latent
         self.flat_h, self.flat_w = h, w
         flat_ch = in_c * h * w
         self.to_latent   = nn.Linear(flat_ch, latent_dim)
         self.from_latent = nn.Linear(latent_dim, flat_ch)
 
-        # decoders
         self.decoders = nn.ModuleList()
         ch //= 2
         for _ in range(levels):
@@ -139,178 +141,165 @@ class UNetAutoencoder(nn.Module):
         return self.decode(z, skips)
 
 ##############################################
-# 4) HDC‑Augmented Decoder Training
+# 4) HDC-Augmented Decoder Training (all on GPU)
 ##############################################
 def train_decoder_with_hdc(model, loader, hdc_dim, group_size, epochs, lr, device):
-    # freeze encoder + bottleneck + to_latent
-    for p in model.encoders.parameters():      p.requires_grad = False
-    for p in model.bottleneck.parameters():     p.requires_grad = False
-    for p in model.to_latent.parameters():      p.requires_grad = False
+    # freeze encoder & to_latent
+    for p in model.encoders.parameters():  p.requires_grad = False
+    for p in model.bottleneck.parameters(): p.requires_grad = False
+    for p in model.to_latent.parameters(): p.requires_grad = False
+
+    # precompute Hadamard keys on GPU
+    H = generate_hadamard(hdc_dim, device)
 
     criterion = nn.MSELoss()
-    opt = optim.Adam(
+    optimizer = optim.Adam(
         list(model.from_latent.parameters()) +
         list(model.decoders.parameters()) +
         list(model.final_conv.parameters()),
         lr=lr
     )
 
-    for ep in range(1, epochs+1):
-        total_loss = 0.0
-        for imgs, labels in loader:
-            imgs  = imgs.to(device)
-            labels= labels.to(device)
+    for epoch in range(1, epochs+1):
+        epoch_loss = 0.0
+        for images, labels in loader:
+            images = images.to(device)
+            labels = labels.to(device)
 
-            # encode once
+            # get clean latents & skips
             with torch.no_grad():
-                z_clean, skips = model.encode(imgs)
-            z_np  = z_clean.cpu().numpy()
-            labs  = labels.cpu().numpy()
-            ld    = z_np.shape[1]
+                z_clean, skips = model.encode(images)
+            B, ld = z_clean.shape
 
-            # pick a class with enough samples
-            u, cts = np.unique(labs, return_counts=True)
-            valid  = u[cts >= group_size]
-            if len(valid)==0: continue
-            cls = np.random.choice(valid)
-            idxs = np.where(labs==cls)[0]
-            sel  = np.random.choice(idxs, group_size, False)
-            group= z_np[sel]
+            # pick a class with ≥ group_size examples
+            uniq, cnts = torch.unique(labels, return_counts=True)
+            valid = uniq[cnts >= group_size]
+            if valid.numel() == 0:
+                continue
+            cls  = valid[torch.randint(len(valid), (1,)).item()]
+            idxs = (labels == cls).nonzero(as_tuple=False).view(-1)
+            sel  = idxs[torch.randperm(idxs.size(0))[:group_size]]
 
-            # bind & bundle
-            bound = []
-            for i, v in enumerate(group):
-                vec = v if ld>=hdc_dim else np.pad(v, (0,hdc_dim-ld), 'constant')
-                bound.append(binding(hdc_dim, i, vec))
-            bundle = np.sum(bound, axis=0)
+            group = z_clean[sel]  # [G, ld]
 
-            # unbind
-            recs = []
-            for i in range(group_size):
-                uvec = unbinding(hdc_dim, i, bundle)
-                recs.append(uvec[:ld])
-            z_noisy = torch.tensor(np.stack(recs), dtype=torch.float32, device=device)
+            # pad to hdc_dim if needed
+            if ld < hdc_dim:
+                pad = torch.zeros((group_size, hdc_dim-ld), device=device)
+                group = torch.cat([group, pad], dim=1)
 
-            # slice skips to match sel
-            new_skips = [skip_tensor[sel] for skip_tensor in skips]
+            # binding & bundling
+            keys   = H[:group_size]           # [G, hdc_dim]
+            bound  = keys * group             # [G, hdc_dim]
+            bundle = bound.sum(dim=0)         # [hdc_dim]
 
-            # decode & loss
-            dec = model.decode(z_noisy, new_skips)
-            tgt = imgs[sel]
-            loss = criterion(dec, tgt)
+            # unbinding & recover
+            rec    = bundle.unsqueeze(0) * keys   # [G, hdc_dim]
+            z_noisy = rec[:, :ld]                 # [G, ld]
 
-            opt.zero_grad()
+            # slice skips
+            sliced_skips = [skip[sel] for skip in skips]
+
+            # decode & optimize
+            decoded = model.decode(z_noisy, sliced_skips)
+            target  = images[sel]
+            loss    = criterion(decoded, target)
+
+            optimizer.zero_grad()
             loss.backward()
-            opt.step()
-            total_loss += loss.item()
+            optimizer.step()
+            epoch_loss += loss.item()
 
-        avg = total_loss / len(loader)
-        print(f"[Epoch {ep}/{epochs}] HDC‑train loss: {avg:.4f}")
+        avg = epoch_loss / len(loader)
+        print(f"[Epoch {epoch}/{epochs}] HDC-train loss: {avg:.4f}")
 
 ##############################################
-# 5) Integration + SSIM + Save
+# 5) Integration + SSIM + Plot (all on GPU)
 ##############################################
 def integration_pipeline(model, loader, hdc_dim, num_samples, device, out_path):
     model.eval()
-    imgs, _ = next(iter(loader))
-    imgs = imgs.to(device)[:num_samples]
+    H = generate_hadamard(hdc_dim, device)
+
+    images, _ = next(iter(loader))
+    images = images.to(device)[:num_samples]
 
     with torch.no_grad():
-        z, skips = model.encode(imgs)
-    z_np = z.cpu().numpy()
-    ld   = z_np.shape[1]
+        z, skips = model.encode(images)
+    B, ld = z.shape
 
-    # bind & bundle all num_samples
-    bound = []
-    for i in range(num_samples):
-        v = z_np[i]
-        vec = v if ld>=hdc_dim else np.pad(v, (0,hdc_dim-ld), 'constant')
-        bound.append(binding(hdc_dim, i, vec))
-    bundle = np.sum(bound, axis=0)
+    if ld < hdc_dim:
+        pad = torch.zeros((num_samples, hdc_dim-ld), device=device)
+        z   = torch.cat([z, pad], dim=1)
 
-    # unbind
-    recs = []
-    for i in range(num_samples):
-        uvec = unbinding(hdc_dim, i, bundle)
-        recs.append(uvec[:ld])
-    z_rec = torch.tensor(np.stack(recs), dtype=torch.float32, device=device)
+    keys   = H[:num_samples]          # [S, hdc_dim]
+    bound  = keys * z                 # [S, hdc_dim]
+    bundle = bound.sum(dim=0)         # [hdc_dim]
 
-    # slice skips for test set
-    new_skips = [skip_tensor[:num_samples] for skip_tensor in skips]
+    rec    = bundle.unsqueeze(0) * keys  # [S, hdc_dim]
+    z_rec  = rec[:, :ld]                 # [S, ld]
 
+    sliced_skips = [skip[:num_samples] for skip in skips]
     with torch.no_grad():
-        dec = model.decode(z_rec, new_skips)
-        s   = ssim_func(imgs, dec, data_range=1.0, size_average=True)
-    print(f"Test SSIM: {s.item():.4f}")
+        decoded = model.decode(z_rec, sliced_skips)
+        score   = ssim_func(images, decoded, data_range=1.0, size_average=True)
+    print(f"Test SSIM: {score.item():.4f}")
 
-    # save plot
-    o = imgs.cpu().numpy()
-    d = dec.cpu().numpy()
-    fig, ax = plt.subplots(2, num_samples, figsize=(2*num_samples, 4))
+    # save comparison plot
+    orig  = images.cpu().numpy()
+    recon = decoded.cpu().numpy()
+    fig, axes = plt.subplots(2, num_samples, figsize=(2*num_samples, 4))
     for i in range(num_samples):
-        ax[0,i].imshow(o[i].squeeze(), cmap='gray'); ax[0,i].axis('off')
-        ax[1,i].imshow(d[i].squeeze(), cmap='gray'); ax[1,i].axis('off')
-    ax[0,0].set_title("Original"); ax[1,0].set_title("Decoded")
+        axes[0,i].imshow(orig[i].squeeze(), cmap='gray');   axes[0,i].axis('off')
+        axes[1,i].imshow(recon[i].squeeze(), cmap='gray'); axes[1,i].axis('off')
+    axes[0,0].set_title("Original"); axes[1,0].set_title("Decoded")
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     print(f"Saved plot to {out_path}")
 
 ##############################################
-# 6) Main & Args
+# 6) Main & Argparse
 ##############################################
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--latent_dim",  type=int, default=2048,
-                   help="latent and HDC dimension (must match)")
-    p.add_argument("--base_ch",     type=int, default=16,
-                   help="base number of channels in U‑Net")
-    p.add_argument("--group_size",  type=int, default=10,
-                   help="how many latents to bundle each HDC training step")
-    p.add_argument("--epochs",      type=int, default=5,
-                   help="HDC training epochs")
-    p.add_argument("--batch_size",  type=int, default=64,
-                   help="MNIST dataloader batch size")
-    p.add_argument("--lr",          type=float, default=1e-3,
-                   help="learning rate for HDC decoder training")
-    p.add_argument("--num_samples", type=int, default=10,
-                   help="samples in final integration test")
-    p.add_argument("--out_path",    type=str,   default="reconstruction.png",
-                   help="where to save the final comparison plot")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="HDC-augmented U-Net Autoencoder")
+    parser.add_argument("--latent_dim",  type=int, default=128,
+                        help="latent vector size (power-of-two!)")
+    parser.add_argument("--base_ch",     type=int, default=8)
+    parser.add_argument("--group_size",  type=int, default=10)
+    parser.add_argument("--epochs",      type=int, default=5)
+    parser.add_argument("--batch_size",  type=int, default=64)
+    parser.add_argument("--lr",          type=float, default=1e-3)
+    parser.add_argument("--num_samples", type=int, default=10)
+    parser.add_argument("--out_path",    type=str, default="reconstruction.png")
+    args = parser.parse_args()
 
-    assert args.latent_dim > 0, "latent_dim must be positive"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Running on", device)
+    print(">>> Running on", device)
 
-    # Data
+    # data
     transform = transforms.ToTensor()
-    ds = torchvision.datasets.MNIST(root="./data", train=True, download=True, transform=transform)
-    loader = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, shuffle=True)
+    ds    = torchvision.datasets.MNIST("./data", train=True, download=True, transform=transform)
+    loader= torch.utils.data.DataLoader(ds, batch_size=args.batch_size, shuffle=True,
+                                        pin_memory=True, num_workers=4)
 
-    # Model
-    latent_dim = args.latent_dim
-    model = UNetAutoencoder(1, args.base_ch, latent_dim, height=28, width=28).to(device)
+    # model
+    model = UNetAutoencoder(1, args.base_ch, args.latent_dim, 28, 28).to(device)
+    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
 
-    # HDC‑augmented decoder training
-    print("→ Starting HDC‑augmented decoder training …")
-    train_decoder_with_hdc(
-        model, loader,
-        hdc_dim    = latent_dim,
-        group_size = args.group_size,
-        epochs     = args.epochs,
-        lr         = args.lr,
-        device     = device
-    )
+    # train HDC decoder
+    print("→ Starting HDC-augmented decoder training …")
+    train_decoder_with_hdc(model, loader,
+                           hdc_dim    = args.latent_dim,
+                           group_size = args.group_size,
+                           epochs     = args.epochs,
+                           lr         = args.lr,
+                           device     = device)
 
-    # Integration + SSIM + save
+    # run integration
     print("→ Running integration pipeline …")
-    integration_pipeline(
-        model, loader,
-        hdc_dim     = latent_dim,
-        num_samples = args.num_samples,
-        device      = device,
-        out_path    = args.out_path
-    )
+    integration_pipeline(model, loader,
+                         hdc_dim     = args.latent_dim,
+                         num_samples = args.num_samples,
+                         device      = device,
+                         out_path    = args.out_path)
 
 if __name__ == "__main__":
     main()

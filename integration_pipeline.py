@@ -7,6 +7,8 @@ import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from pytorch_msssim import ssim as ssim_func
+from tqdm import tqdm
+
 
 ##############################################
 # helper: build a power-of-2 Hadamard on GPU
@@ -300,6 +302,84 @@ def main():
                          num_samples = args.num_samples,
                          device      = device,
                          out_path    = args.out_path)
+    
+def run_experiment():
+    # fixed params
+    base_ch    = 8
+    group_size = 10
+    epochs     = 5
+    batch_size = 64
+    lr         = 1e-3
+    num_samples= 10
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("→ Running on", device)
+
+    # data
+    ds     = torchvision.datasets.MNIST("./data", train=True, download=True,
+                                        transform=transforms.ToTensor())
+    loader = torch.utils.data.DataLoader(ds, batch_size=batch_size,
+                                         shuffle=True, pin_memory=True,
+                                         num_workers=4)
+
+    dims, scores = [2**k for k in range(4,15)], []
+    for dim in tqdm(dims, desc="Sweeping latent_dim"):
+        # build model
+        model = UNetAutoencoder(1, base_ch, dim, 28, 28).to(device)
+
+        # train decoder w/ HDC
+        print(f"\n→ Training (latent_dim={dim})")
+        train_decoder_with_hdc(model, loader, dim, group_size, epochs, lr, device)
+
+        # test & save reconstructions
+        print(f"→ Testing (latent_dim={dim})")
+        H = generate_hadamard(dim, device)
+        images, _ = next(iter(loader))
+        images = images.to(device)[:num_samples]
+
+        with torch.no_grad():
+            z, skips = model.encode(images)
+        B, ld = z.shape
+        if ld < dim:
+            pad = torch.zeros((num_samples, dim-ld), device=device)
+            z   = torch.cat([z, pad], dim=1)
+
+        keys   = H[:num_samples]
+        bound  = keys * z
+        bundle = bound.sum(dim=0)
+        rec    = bundle.unsqueeze(0) * keys
+        z_rec  = rec[:, :ld]
+        skips_s= [s[:num_samples] for s in skips]
+
+        with torch.no_grad():
+            decoded = model.decode(z_rec, skips_s)
+            score   = ssim_func(images, decoded, data_range=1.0, size_average=True).item()
+        print(f"  SSIM @ {dim}: {score:.4f}")
+        scores.append(score)
+
+        # save this reconstruction
+        orig, recon = images.cpu().numpy(), decoded.cpu().numpy()
+        fig, axes = plt.subplots(2, num_samples, figsize=(2*num_samples,4))
+        for i in range(num_samples):
+            axes[0,i].imshow(orig[i].squeeze(), cmap='gray'); axes[0,i].axis('off')
+            axes[1,i].imshow(recon[i].squeeze(), cmap='gray'); axes[1,i].axis('off')
+        axes[0,0].set_title("Orig"); axes[1,0].set_title("Recon")
+        plt.tight_layout()
+        plt.savefig(f"reconstruction_dim_{dim}.png", dpi=150)
+        plt.close(fig)
+
+    # final plot
+    plt.figure(figsize=(8,5))
+    plt.plot(dims, scores, marker='o')
+    plt.xscale('log', base=2)
+    plt.xlabel('latent_dim (power of 2)')
+    plt.ylabel('SSIM')
+    plt.title('latent_dim vs SSIM')
+    plt.grid(True, which='both', ls='--', alpha=0.5)
+    plt.tight_layout()
+    plt.savefig("ssim_vs_latent_dim.png", dpi=150)
+    print("→ Saved ssim_vs_latent_dim.png")
 
 if __name__ == "__main__":
-    main()
+    # main()
+    run_experiment()

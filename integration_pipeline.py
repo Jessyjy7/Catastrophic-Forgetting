@@ -307,7 +307,7 @@ def run_experiment():
     # fixed params
     base_ch    = 8
     group_size = 10
-    epochs     = 10
+    epochs     = 15
     batch_size = 64
     lr         = 1e-3
     num_samples= 10

@@ -306,11 +306,11 @@ def main():
 def run_experiment():
     # fixed params
     base_ch    = 8
-    group_size = 10
-    epochs     = 15
+    group_size = 15
+    epochs     = 10
     batch_size = 64
     lr         = 1e-3
-    num_samples= 10
+    num_samples= 15
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("→ Running on", device)

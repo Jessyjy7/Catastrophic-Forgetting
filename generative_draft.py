@@ -1,358 +1,335 @@
 import argparse
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from torchvision.datasets import MNIST
+import torchvision
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
+import torch.nn.functional as F
 from pytorch_msssim import ssim as ssim_func
-import psutil  # For CPU memory tracking
+from tqdm import tqdm
 
+from torchvision.datasets import MNIST, CIFAR10, Flowers102
 
-# -------------------------------
-# 1) Define Model Components
-# -------------------------------
+##############################################
+# 0) Dataset loader factory
+##############################################
+def get_loader(dataset_name, batch_size):
+    if dataset_name == "MNIST":
+        in_ch, H, W = 1, 28, 28
+        tf = transforms.ToTensor()
+        ds = MNIST("./data", train=True, download=True, transform=tf)
 
+    elif dataset_name == "CIFAR10":
+        in_ch, H, W = 3, 32, 32
+        tf = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        ds = CIFAR10("./data", train=True, download=True, transform=tf)
+
+    elif dataset_name == "Flowers102":
+        in_ch, H, W = 3, 64, 64
+        tf = transforms.Compose([
+            transforms.Resize((H, W)),
+            transforms.ToTensor(),
+        ])
+        ds = Flowers102("./data", split="train", download=True, transform=tf)
+
+    else:
+        raise ValueError(f"Unknown dataset {dataset_name}")
+
+    loader = torch.utils.data.DataLoader(
+        ds, batch_size=batch_size, shuffle=True,
+        pin_memory=True, num_workers=4
+    )
+    return loader, in_ch, H, W
+
+##############################################
+# 1) HDC helper
+##############################################
+def generate_hadamard(n: int, device: torch.device) -> torch.Tensor:
+    assert n > 0 and (n & (n-1)) == 0, "hdc_dim must be power-of-two"
+    H = torch.tensor([[1.]], dtype=torch.float32, device=device)
+    while H.shape[0] < n:
+        H = torch.cat([
+            torch.cat([H,  H], dim=1),
+            torch.cat([H, -H], dim=1),
+        ], dim=0)
+    return H
+
+##############################################
+# 2) U-Net / Residual / Attention blocks
+##############################################
 class ResidualBlock(nn.Module):
-    """Simple residual block with two convolutional layers."""
     def __init__(self, channels):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
         self.bn1   = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
         self.bn2   = nn.BatchNorm2d(channels)
-
     def forward(self, x):
-        residual = x
+        res = x
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-        out += residual
+        out += res
         return F.relu(out)
 
 class AttentionBlock(nn.Module):
-    """Attention mechanism to emphasize important features."""
     def __init__(self, in_channels):
-        super(AttentionBlock, self).__init__()
-        self.conv = nn.Conv2d(in_channels, 1, kernel_size=1)
-    
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, 1, 1)
     def forward(self, x):
-        attention = torch.sigmoid(self.conv(x))
-        return x * attention
+        return x * torch.sigmoid(self.conv(x))
 
 class EncoderBlock(nn.Module):
-    """
-    Single encoder block: 
-    (Conv + ResidualBlock) -> MaxPool(2x2).
-    """
-    def __init__(self, in_channels, out_channels):
-        super(EncoderBlock, self).__init__()
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-            ResidualBlock(out_channels)
+            ResidualBlock(out_ch)
         )
-        self.pool = nn.MaxPool2d(2)  # halves the spatial dimension
-
+        self.pool = nn.MaxPool2d(2)
     def forward(self, x):
-        x = self.conv(x)
-        p = self.pool(x)
-        return x, p  # 'x' for skip connection, 'p' for pooled output
+        skip = self.conv(x)
+        down = self.pool(skip)
+        return skip, down
 
 class DecoderBlock(nn.Module):
-    """
-    Single decoder block:
-    Upsample -> ResidualBlock -> Attention -> Concatenate skip -> Conv.
-
-    Allows a custom 'upsample_layer' if you need something other than the default
-    2x2 stride=2 transposed convolution.
-    """
-    def __init__(self, in_channels, out_channels, upsample_layer=None):
-        super(DecoderBlock, self).__init__()
-        # If no custom upsample layer is given, default to a 2x2 stride=2 transpose conv
-        if upsample_layer is None:
-            self.upsample = nn.ConvTranspose2d(
-                in_channels, out_channels, kernel_size=2, stride=2
-            )
-        else:
-            self.upsample = upsample_layer
-
-        self.res_block = ResidualBlock(out_channels)
-        self.attn = AttentionBlock(out_channels)
-        self.conv = nn.Conv2d(out_channels * 2, out_channels, kernel_size=3, padding=1)
-
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.up   = nn.ConvTranspose2d(in_ch, out_ch, 2, stride=2)
+        self.res  = ResidualBlock(out_ch)
+        self.att  = AttentionBlock(out_ch)
+        self.conv = nn.Conv2d(out_ch*2, out_ch, 3, padding=1)
     def forward(self, x, skip):
-        x = self.upsample(x)
-        x = self.res_block(x)
-        x = self.attn(x)
+        x = self.up(x)
+        x = self.res(x)
+        x = self.att(x)
         x = torch.cat([x, skip], dim=1)
-        x = F.relu(self.conv(x))
-        return x
+        return F.relu(self.conv(x))
 
-# -------------------------------
-# 2) 3-Level U-Net (28->14->7->3)
-# -------------------------------
+class UNetAutoencoder(nn.Module):
+    def __init__(self, in_ch, base_ch, latent_dim, height, width):
+        super().__init__()
+        levels = 0
+        h, w = height, width
+        while h >= 8 and w >= 8:
+            h //= 2; w //= 2; levels += 1
+        self.levels = levels
 
-class EncoderDecoderNet(nn.Module):
-    """
-    A 3-level U-Net–style network for 28×28 MNIST images,
-    compressing the spatial dimensions down to 3×3 at the deepest part.
-    """
-    def __init__(self, input_channels=1, output_channels=1, base_channels=16):
-        super(EncoderDecoderNet, self).__init__()
-        
-        # --- Encoder ---
-        self.enc1 = EncoderBlock(input_channels, base_channels)   # 28->14
-        # Instead of doubling channels, keep the same:
-        self.enc2 = EncoderBlock(base_channels, base_channels)    # 14->7
-        self.enc3 = EncoderBlock(base_channels, base_channels)    # 7->3
+        # encoder
+        self.encoders = nn.ModuleList()
+        ch = base_ch; in_c = in_ch
+        for _ in range(levels):
+            self.encoders.append(EncoderBlock(in_c, ch))
+            in_c = ch; ch *= 2
 
-        # --- Bottleneck ---
+        # bottleneck
         self.bottleneck = nn.Sequential(
-            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(base_channels),
+            nn.Conv2d(in_c, in_c, 3, padding=1),
+            nn.BatchNorm2d(in_c),
             nn.ReLU(inplace=True),
-            ResidualBlock(base_channels)  # optional
+            ResidualBlock(in_c)
         )
-        
-        # --- Decoder ---
-        # 3->7 with a custom upsample to match the 3->7 shape
-        custom_upsample_3to7 = nn.ConvTranspose2d(
-            in_channels=base_channels,
-            out_channels=base_channels,
-            kernel_size=4,
-            stride=2,
-            padding=1,
-            output_padding=1
-        )
-        self.dec3 = DecoderBlock(base_channels, base_channels, upsample_layer=custom_upsample_3to7)
-        
-        self.dec2 = DecoderBlock(base_channels, base_channels)  # 7->14
-        self.dec1 = DecoderBlock(base_channels, base_channels)  # 14->28
-        
-        self.final_conv = nn.Conv2d(base_channels, output_channels, kernel_size=1)
 
-    def forward(self, x):
-        s1, p1 = self.enc1(x)
-        s2, p2 = self.enc2(p1)
-        s3, p3 = self.enc3(p2)
-        
-        bn = self.bottleneck(p3)
-        
-        d3 = self.dec3(bn, s3)
-        d2 = self.dec2(d3, s2)
-        d1 = self.dec1(d2, s1)
-        
-        out = self.final_conv(d1)
-        return out
+        # latent
+        self.flat_h, self.flat_w = h, w
+        flat_ch = in_c * h * w
+        self.to_latent   = nn.Linear(flat_ch, latent_dim)
+        self.from_latent = nn.Linear(latent_dim, flat_ch)
 
-# -------------------------------
-# 2) Training & Evaluation
-# -------------------------------
+        # decoder
+        self.decoders = nn.ModuleList()
+        ch //= 2
+        for _ in range(levels):
+            self.decoders.append(DecoderBlock(in_c, ch))
+            in_c = ch; ch //= 2
 
-def train_autoencoder(model, device, epochs=5, batch_size=64, lr=1e-3):
-    """
-    Train the autoencoder on MNIST using MSE loss.
-    """
-    # 1. MNIST training data
-    transform = transforms.ToTensor()
-    train_dataset = MNIST(root='./data', train=True, download=True, transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        self.final_conv = nn.Conv2d(in_c, in_ch, 1)
 
-    # 2. Loss & Optimizer
+    def encode(self, x):
+        skips, out = [], x
+        for enc in self.encoders:
+            skip, out = enc(out)
+            skips.append(skip)
+        out = self.bottleneck(out)
+        B, C, H, W = out.shape
+        flat = out.view(B, -1)
+        z    = self.to_latent(flat)
+        return z, skips
+
+    def decode(self, z, skips):
+        B = z.size(0)
+        flat = self.from_latent(z)
+        out  = flat.view(B, -1, self.flat_h, self.flat_w)
+        for dec, skip in zip(self.decoders, reversed(skips)):
+            out = dec(out, skip)
+        return torch.sigmoid(self.final_conv(out))
+
+##############################################
+# 3) HDC-augmented decoder training
+##############################################
+def train_decoder_with_hdc(model, loader, hdc_dim, group_size, epochs, lr, device):
+    for p in model.encoders.parameters():      p.requires_grad = False
+    for p in model.bottleneck.parameters():     p.requires_grad = False
+    for p in model.to_latent.parameters():      p.requires_grad = False
+
+    H = generate_hadamard(hdc_dim, device)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.Adam(
+        list(model.from_latent.parameters()) +
+        list(model.decoders.parameters()) +
+        list(model.final_conv.parameters()), lr=lr
+    )
 
-    # 3. Training Loop
-    model.train()
-    for epoch in range(epochs):
-        running_loss = 0.0
-        for images, _ in train_loader:
-            images = images.to(device)
+    for epoch in range(1, epochs+1):
+        total_loss = 0.0
+        for images, labels in loader:
+            images, labels = images.to(device), labels.to(device)
+            with torch.no_grad():
+                z_clean, skips = model.encode(images)
+            B, ld = z_clean.shape
 
-            # Forward pass
-            outputs = model(images)
+            uniq, cnts = torch.unique(labels, return_counts=True)
+            valid = uniq[cnts >= group_size]
+            if valid.numel() == 0: continue
+            cls  = valid[torch.randint(len(valid), (1,)).item()]
+            idxs = (labels==cls).nonzero(as_tuple=False).view(-1)
+            sel  = idxs[torch.randperm(idxs.size(0))[:group_size]]
 
-            # Compute reconstruction loss
-            loss = criterion(outputs, images)
+            grp = z_clean[sel]
+            if ld < hdc_dim:
+                pad = torch.zeros((group_size, hdc_dim-ld), device=device)
+                grp = torch.cat([grp, pad], dim=1)
 
-            # Backprop & update
+            idx = torch.arange(group_size, device=device) % hdc_dim
+            keys   = H[idx]
+            bundle = (keys * grp).sum(dim=0)
+            rec    = bundle.unsqueeze(0) * keys
+            z_noisy= rec[:, :ld]
+
+            skips_sel = [s[sel] for s in skips]
+            decoded = model.decode(z_noisy, skips_sel)
+            loss    = criterion(decoded, images[sel])
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            total_loss += loss.item()
 
-            running_loss += loss.item()
+        print(f"[Epoch {epoch}/{epochs}] Loss: {total_loss/len(loader):.4f}")
 
-        avg_loss = running_loss / len(train_loader)
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}")
-
-    print("Training complete!")
-
-def compute_ssim(model, device, batch_size=64):
-    """
-    Compute the average SSIM on the MNIST test set.
-    """
-    transform = transforms.ToTensor()
-    test_dataset = MNIST(root='./data', train=False, download=True, transform=transform)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
+##############################################
+# 4) Integration + SSIM
+##############################################
+def integration_pipeline(model, loader, hdc_dim, num_samples, device, out_path):
     model.eval()
-    ssim_scores = []
+    H = generate_hadamard(hdc_dim, device)
+
+    images, _ = next(iter(loader))
+    images = images.to(device)[:num_samples]
 
     with torch.no_grad():
-        for images, _ in test_loader:
-            images = images.to(device)
-            outputs = model(images)
+        z, skips = model.encode(images)
+    B, ld = z.shape
+    if ld < hdc_dim:
+        pad = torch.zeros((num_samples, hdc_dim-ld), device=device)
+        z   = torch.cat([z, pad], dim=1)
 
-            # Ensure values are in [0,1] for SSIM
-            outputs = torch.clamp(outputs, 0.0, 1.0)
+    idx = torch.arange(num_samples, device=device) % hdc_dim
+    keys   = H[idx]
+    bundle = (keys * z).sum(dim=0)
+    rec    = bundle.unsqueeze(0) * keys
+    z_rec  = rec[:, :ld]
+    skips_s= [s[:num_samples] for s in skips]
 
-            # ssim_func returns a single scalar if shape is NxCxHxW
-            batch_ssim = ssim_func(images, outputs, data_range=1.0, size_average=True)
-            ssim_scores.append(batch_ssim.item())
-
-    return sum(ssim_scores) / len(ssim_scores)
-
-def show_original_decoded(model, device, num_images=8):
-    """
-    Fetch a batch of MNIST images, run them through the model, 
-    and plot original vs decoded side by side.
-    """
-    test_dataset = MNIST(root='./data', train=False, download=True, transform=transforms.ToTensor())
-    test_loader = DataLoader(test_dataset, batch_size=num_images, shuffle=True)
-
-    images, _ = next(iter(test_loader))
-    images = images.to(device)
-
-    model.eval()
     with torch.no_grad():
-        decoded = model(images)
+        decoded = model.decode(z_rec, skips_s)
+        score   = ssim_func(images, decoded, data_range=1.0, size_average=True).item()
+    print(f"Test SSIM: {score:.4f}")
 
-    # Clamp outputs to [0,1] for display
-    decoded = torch.clamp(decoded, 0.0, 1.0)
-
-    images = images.cpu()
-    decoded = decoded.cpu()
-
-    # Plot
-    fig, axes = plt.subplots(2, num_images, figsize=(2 * num_images, 4))
-    for i in range(num_images):
-        # Original
-        axes[0, i].imshow(images[i].squeeze(), cmap='gray')
-        axes[0, i].axis('off')
-        if i == (num_images // 2):
-            axes[0, i].set_title("Original", fontsize=12)
-
-        # Decoded
-        axes[1, i].imshow(decoded[i].squeeze(), cmap='gray')
-        axes[1, i].axis('off')
-        if i == (num_images // 2):
-            axes[1, i].set_title("Decoded", fontsize=12)
-
+    orig, recon = images.cpu().numpy(), decoded.cpu().numpy()
+    fig, axes = plt.subplots(2, num_samples, figsize=(2*num_samples,4))
+    for i in range(num_samples):
+        axes[0,i].imshow(orig[i].transpose(1,2,0)); axes[0,i].axis('off')
+        axes[1,i].imshow(recon[i].transpose(1,2,0)); axes[1,i].axis('off')
+    axes[0,0].set_title("Orig"); axes[1,0].set_title("Recon")
     plt.tight_layout()
-    plt.show()
+    plt.savefig(out_path, dpi=150)
+    plt.close(fig)
 
-    # Save figure to file if you want
-    plt.savefig("decoded_comparison.png")
-    print("Plot saved as decoded_comparison.png")
+    return score
 
-# -------------------------------
-# Memory Tracking Utilities
-# -------------------------------
+##############################################
+# 5) Sweep experiment
+##############################################
+def run_experiment(dataset_name, args):
+    loader, in_ch, H, W = get_loader(dataset_name, args.batch_size)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dims, scores = [2**k for k in range(3,15)], []
 
-def get_model_memory(model):
-    """Calculate memory used by model parameters."""
-    total_params = sum(p.numel() for p in model.parameters())
-    total_memory = sum(p.element_size() * p.numel() for p in model.parameters())
-    print(f"Total Model Parameters: {total_params}")
-    print(f"Total Model Memory Usage: {total_memory / 1024**2:.2f} MB")
+    for dim in tqdm(dims, desc=f"Sweeping {dataset_name}"):
+        model = UNetAutoencoder(in_ch, args.base_ch, dim, H, W).to(device)
+        train_decoder_with_hdc(model, loader, dim, args.group_size,
+                               args.epochs, args.lr, device)
+        out_path = f"{dataset_name}_recon_dim_{dim}.png"
+        score = integration_pipeline(model, loader, dim,
+                                     args.num_samples, device, out_path)
+        scores.append(score)
 
-def get_gpu_memory_usage():
-    """Display current and maximum GPU memory usage (if CUDA is available)."""
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1024**2
-        max_allocated = torch.cuda.max_memory_allocated() / 1024**2
-        print(f"Current Allocated GPU Memory: {allocated:.2f} MB")
-        print(f"Max Allocated GPU Memory: {max_allocated:.2f} MB")
-    else:
-        print("CUDA is not available.")
+    plt.figure(figsize=(8,5))
+    plt.plot(dims, scores, marker='o')
+    plt.xscale('log', base=2)
+    plt.xlabel('latent_dim')
+    plt.ylabel('SSIM')
+    plt.title(f'{dataset_name}: latent_dim vs SSIM')
+    plt.grid(True, which='both', ls='--', alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(f"{dataset_name}_ssim_vs_latent_dim.png", dpi=150)
+    print(f"→ Saved {dataset_name}_ssim_vs_latent_dim.png")
 
-def get_cpu_memory_usage():
-    """Display the current process CPU memory usage."""
-    process = psutil.Process()
-    mem_info = process.memory_info()
-    print(f"Current Process Memory Usage: {mem_info.rss / 1024**2:.2f} MB")
-
-def get_activation_memory(model, input_shape=(1, 1, 28, 28)):
-    """
-    Estimate memory used by activations during a forward pass.
-    Note: This only tracks layers that are instances of common modules.
-    """
-    input_tensor = torch.randn(input_shape).to(next(model.parameters()).device)
-    activation_mem = 0
-
-    def hook_fn(module, inp, output):
-        nonlocal activation_mem
-        activation_mem += output.element_size() * output.numel()
-
-    hooks = []
-    for layer in model.modules():
-        if isinstance(layer, (nn.Conv2d, nn.ReLU, nn.MaxPool2d, nn.BatchNorm2d, nn.Linear)):
-            hooks.append(layer.register_forward_hook(hook_fn))
-
-    with torch.no_grad():
-        model(input_tensor)
-
-    for h in hooks:
-        h.remove()
-
-    print(f"Total Activation Memory: {activation_mem / 1024**2:.2f} MB")
-
-# -------------------------------
-# 3) Main Script with argparse
-# -------------------------------
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a U-Net style autoencoder on MNIST.")
-    parser.add_argument("--epochs", type=int, default=5, help="Number of epochs to train.")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
-    parser.add_argument("--base_channels", type=int, default=32, help="Number of base channels in the model.")
-    parser.add_argument("--num_images", type=int, default=8, help="Number of images to visualize.")
+##############################################
+# 6) Main & Argparse
+##############################################
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", choices=["MNIST","CIFAR10","Flowers102"], default="MNIST")
+    parser.add_argument("--mode",    choices=["single","sweep"], default="single")
+    parser.add_argument("--latent_dim", type=int,   default=128)
+    parser.add_argument("--base_ch",    type=int,   default=8)
+    parser.add_argument("--group_size", type=int,   default=10)
+    parser.add_argument("--epochs",     type=int,   default=5)
+    parser.add_argument("--batch_size", type=int,   default=64)
+    parser.add_argument("--lr",         type=float, default=1e-3)
+    parser.add_argument("--num_samples",type=int,   default=10)
+    parser.add_argument("--out_path",   type=str,   default="reconstruction.png")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = EncoderDecoderNet(
-        input_channels=1,
-        output_channels=1,
-        base_channels=args.base_channels
-    ).to(device)
+    if args.mode == "single":
+        loader, in_ch, H, W = get_loader(args.dataset, args.batch_size)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Running on {device} with {args.dataset}")
 
-    # --- Memory Tracking Before Training ---
-    print("=== Memory Usage Before Training ===")
-    get_model_memory(model)
-    get_cpu_memory_usage()
-    get_gpu_memory_usage()
-    get_activation_memory(model)
+        model = UNetAutoencoder(in_ch, args.base_ch,
+                                args.latent_dim, H, W).to(device)
+        print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
+        size_mb = sum(p.numel()*p.element_size() for p in model.parameters())/(1024**2)
+        print(f"Model size: {size_mb:.2f} MB")
 
-    # 1. Train the model
-    print("\nTraining the autoencoder...")
-    train_autoencoder(model, device, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
+        print("→ Training HDC-augmented decoder …")
+        train_decoder_with_hdc(model, loader,
+                               args.latent_dim, args.group_size,
+                               args.epochs, args.lr, device)
 
-    # --- Memory Tracking After Training ---
-    print("\n=== Memory Usage After Training ===")
-    get_model_memory(model)
-    get_cpu_memory_usage()
-    get_gpu_memory_usage()
-    # Optionally, you can check activation memory again:
-    get_activation_memory(model)
+        print("→ Running integration pipeline …")
+        integration_pipeline(model, loader,
+                             args.latent_dim, args.num_samples,
+                             device, args.out_path)
 
-    # 2. Compute SSIM on the test set
-    print("\nEvaluating SSIM on test set...")
-    avg_ssim = compute_ssim(model, device, batch_size=args.batch_size)
-    print(f"Average SSIM on MNIST test set: {avg_ssim:.4f}")
+    else:
+        run_experiment(args.dataset, args)
 
-    # 3. Show original vs decoded images
-    show_original_decoded(model, device, num_images=args.num_images)
-
+if __name__ == "__main__":
+    main()

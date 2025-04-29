@@ -285,6 +285,10 @@ def main():
     # model
     model = UNetAutoencoder(1, args.base_ch, args.latent_dim, 28, 28).to(device)
     print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
+    
+    param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    param_mb    = param_bytes / (1024**2)
+    print(f"Approximate model size (float32): {param_mb:.2f} MB")
 
     # train HDC decoder
     print("→ Starting HDC-augmented decoder training …")

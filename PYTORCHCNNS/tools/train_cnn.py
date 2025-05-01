@@ -7,7 +7,7 @@ import copy
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset, Subset
+from torch.utils.data import DataLoader, TensorDataset, Subset, ConcatDataset
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
@@ -15,8 +15,8 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from model_zoo import models
-from model_zoo.models import mlp  # if you have an MLP
-# from model_zoo.utils import count_layers  # optional
+from model_zoo.models import mlp 
+
 
 ##############################################################################
 # 1. Replicate Channels for MobileNet
@@ -222,171 +222,104 @@ def sequential_train_with_buffer(model, device, criterion, optimizer, epochs, te
         for i, acc in enumerate(per_digit_acc):
             print(f"Accuracy on Digit {i}: {acc:.2f}%")
 
-def sequential_train_with_buffer_using_decoded(model, device, criterion, optimizer, epochs, test_loader, args, train_set):
+
+def sequential_train_with_buffer_using_decoded(
+    model, device, criterion, optimizer,
+    epochs, test_loader, args, train_set
+):
     """
-    Sequential training on digits 0..9, using a .pt file of pre-decoded images.
-    We assume the .pt file is a list of (decoded_image, label), 
-    e.g., "decoded_buffer_MNIST.pt" created by your autoencoder script.
+    Class‐incremental on 0..9.  For each digit d, we build a
+    single DataLoader containing:
+      - all decoded buffer imgs for labels < d
+      - all raw MNIST imgs for label == d
+    and train for `epochs` epochs over that loader.
     """
+    print("\n=== Starting sequential training with DECODED replay buffer ===")
 
-    print("\n=== Starting sequential training with DECODED replay buffer (.pt) ===")
+    # 1) Load & unpack replay_buffer.pkl
+    with open("../../replay_buffer.pkl", "rb") as f:
+        replay_dict = pickle.load(f)
 
-    # 1. Load the decoded replay buffer
-    # e.g., "decoded_buffer_MNIST.pt", "decoded_buffer_CIFAR10.pt", etc.
-    buffer_file = "../../decoded_buffer_MNIST.pt"  # or adapt if you store differently
-    decoded_buffer = torch.load(buffer_file)
-    print(f"Loaded {len(decoded_buffer)} decoded samples from {buffer_file}")
+    buf_imgs, buf_lbls = [], []
+    for lbl, arrs in replay_dict.items():
+        for arr in arrs:
+            t = torch.tensor(arr, dtype=torch.float32)
+            if t.ndim == 2:    # MNIST gray
+                t = t.unsqueeze(0)
+            buf_imgs.append(t)
+            buf_lbls.append(int(lbl))
 
-    # 2. Group decoded images by label
-    #    We'll build a dictionary: {label: [list_of_tensors]}
-    from collections import defaultdict
-    label_dict = defaultdict(list)
-    for (img_tensor, lbl) in decoded_buffer:
-        lbl = int(lbl)
-        label_dict[lbl].append(img_tensor)
+    buf_tensor = torch.stack(buf_imgs, dim=0)   # [N_buf, C, H, W]
+    lbl_tensor = torch.tensor(buf_lbls, dtype=torch.long)
+    full_buffer_ds = TensorDataset(buf_tensor, lbl_tensor)
 
-    # 3. Class-Incremental Loop for digits 0..9
+    # 2) A tiny Subset wrapper that converts its label to a Tensor
+    class LabelSubset(Subset):
+        def __init__(self, dataset, indices):
+            super().__init__(dataset, indices)
+        def __getitem__(self, idx):
+            img, lbl = super().__getitem__(idx)
+            return img, torch.tensor(lbl, dtype=torch.long)
+
+    # 3) Loop over digits
     for digit in range(10):
-        print(f"\nTraining on digit {digit} with decoded replay buffer for {epochs} epochs")
+        print(f"\n--- Training on digit {digit} with buffer for {epochs} epochs ---")
 
-        # 3.1 Gather old-digit images from label_dict for all digits < current
-        replay_images = []
-        replay_labels = []
-        for seen_digit in range(digit):
-            for old_img in label_dict[seen_digit]:
-                replay_images.append(old_img)
-                replay_labels.append(seen_digit)
+        # 3.1 Build buffer subset of only classes < digit
+        if digit > 0:
+            mask = (lbl_tensor < digit)
+            idxs = mask.nonzero(as_tuple=False).view(-1).tolist()
+            seen_ds = Subset(full_buffer_ds, idxs)
+        else:
+            seen_ds = None
 
-        # 3.2 Gather real images for the current digit from train_set
-        #     (Using your existing get_digit_loader logic)
-        digit_loader = get_digit_loader(digit, train_set, batch_size=args.batch_size, train=True)
-        current_digit_images = []
-        current_digit_labels = []
-        for data, targets in digit_loader:
-            # data, targets are on CPU by default
-            if args.model == 'mobilenet':
-                data = replicate_channels(data)
-            current_digit_images.extend(data)
-            current_digit_labels.extend(targets)
+        # 3.2 Build new‐digit subset (and wrap its labels)
+        new_idxs = [i for i, lab in enumerate(train_set.targets) if int(lab) == digit]
+        new_ds   = LabelSubset(train_set, new_idxs)
 
-        # 3.3 Combine old-digit replay + new-digit real images
-        combined_images = []
-        combined_labels = []
+        # 3.3 Concat old + new
+        if seen_ds is not None:
+            combined_ds = ConcatDataset([seen_ds, new_ds])
+        else:
+            combined_ds = new_ds
 
-        # (A) Replay images
-        for i in range(len(replay_images)):
-            # Each replay_images[i] is shape [C,H,W]
-            combined_images.append(replay_images[i].unsqueeze(0))  
-            combined_labels.append(torch.tensor(replay_labels[i], dtype=torch.long))
+        combined_loader = DataLoader(
+            combined_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            pin_memory=True,
+            num_workers=0    # ← single‐process loader
+        )
 
-        # (B) Current digit images
-        for i in range(len(current_digit_images)):
-            img = current_digit_images[i]
-            lbl = current_digit_labels[i]
-            combined_images.append(img.unsqueeze(0))
-            combined_labels.append(lbl)
-
-        if len(combined_images) == 0:
-            print(f"No data found for digit {digit}, skipping.")
-            continue
-
-        # Stack into a single dataset
-        combined_images_tensor = torch.cat(combined_images, dim=0)  # shape [N, C, H, W]
-        combined_labels_tensor = torch.stack(combined_labels)        # shape [N]
-        combined_dataset = TensorDataset(combined_images_tensor, combined_labels_tensor)
-        combined_loader = DataLoader(combined_dataset, batch_size=args.batch_size, shuffle=True)
-
-        # 3.4 Train the model for 'epochs'
+        # 4) Train
         model.train()
         for ep in range(epochs):
             running_loss = 0.0
-            for data_cpu, target_cpu in combined_loader:
-                # Move to GPU if available
-                data_gpu = data_cpu.to(device)
-                target_gpu = target_cpu.to(device)
-
+            for x_cpu, y_cpu in combined_loader:
+                x = x_cpu.to(device)
+                y = y_cpu.to(device)
                 if args.model == 'mobilenet':
-                    data_gpu = replicate_channels(data_gpu)
+                    x = replicate_channels(x)
 
                 optimizer.zero_grad()
-                output = model(data_gpu)
-                loss = criterion(output, target_gpu)
+                out = model(x)
+                loss = criterion(out, y)
                 loss.backward()
                 optimizer.step()
                 running_loss += loss.item()
 
-            avg_loss = running_loss / len(combined_loader)
-            print(f"Digit {digit}, Epoch {ep+1}/{epochs}, Loss={avg_loss:.4f}")
+            avg = running_loss / len(combined_loader)
+            print(f"Digit {digit}  Ep {ep+1}/{epochs}  loss={avg:.4f}")
 
-        # 3.5 Evaluate on the full test_loader
-        overall_acc, per_digit_acc = evaluate_accuracy(model, test_loader, device, args.model)
-        print(f"After training digit {digit} with decoded buffer:")
-        print(f"Overall Accuracy: {overall_acc:.2f}%")
+        # 5) Evaluate on full test set
+        overall_acc, per_digit_acc = evaluate_accuracy(
+            model, test_loader, device, args.model
+        )
+        print(f"\nAfter digit {digit} → Overall: {overall_acc:.2f}%")
         for i, acc in enumerate(per_digit_acc):
-            print(f"Accuracy on Digit {i}: {acc:.2f}%")
+            print(f"  Digit {i}: {acc:.2f}%")
 
 
-
-def train_with_decoded_buffer_only(model, device, criterion, optimizer, epochs, batch_size, args):
-    """
-    Train using ONLY the decoded replay buffer.
-    """
-    print("\n=== Starting training with decoded buffer ONLY ===")
-    with open("../../replay_buffer.pkl", "rb") as f:
-        decoded_replay_buffer = pickle.load(f)
-
-
-    print("Replay Buffer Keys:", decoded_replay_buffer.keys())
-    for digit, images in decoded_replay_buffer.items():
-        print(f"Digit {digit}: {len(images)} images")
-
-    buffer_images = []
-    buffer_labels = []
-    for digit in range(10):
-        decoded_images = decoded_replay_buffer[digit]
-        for img_np in decoded_images:
-            img_t = torch.tensor(img_np, dtype=torch.float32)
-            if img_t.dim() == 2:
-                img_t = img_t.unsqueeze(0)  # => [1, H, W]
-            if args.model == 'mobilenet' and img_t.shape[0] == 1:
-                img_t = img_t.repeat(3, 1, 1)
-            buffer_images.append(img_t)
-            buffer_labels.append(torch.tensor(digit, dtype=torch.long))
-
-    if len(buffer_images) == 0:
-        print("No decoded images found!")
-        return
-
-    buffer_images = [img.unsqueeze(0) if img.dim() == 3 else img for img in buffer_images]
-    buffer_images_tensor = torch.cat(buffer_images, dim=0)
-    buffer_labels_tensor = torch.stack(buffer_labels)
-
-    buffer_dataset = TensorDataset(buffer_images_tensor, buffer_labels_tensor)
-    buffer_loader = DataLoader(buffer_dataset, batch_size=batch_size, shuffle=True)
-
-    # Train
-    model.train()
-    for epoch in range(epochs):
-        running_loss = 0.0
-        for data, target in buffer_loader:
-            data, target = data.to(device), target.to(device)
-            optimizer.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss/len(buffer_loader):.4f}")
-
-    # Evaluate on the buffer
-    print("\nEvaluating model performance on the decoded buffer itself...")
-    overall_acc, per_digit_acc = evaluate_accuracy(model, buffer_loader, device, args.model)
-    print(f"Overall Accuracy: {overall_acc:.2f}%")
-    for digit, acc in enumerate(per_digit_acc):
-        print(f"Accuracy on Digit {digit}: {acc:.2f}%")
-        
-        
-        
         
 def lifelong_learning(model, device, criterion, optimizer, test_loader, args):
     """
@@ -613,7 +546,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset', type=str, required=True)
     parser.add_argument('--checkpoint', type=str, required=True, help='prefix name for the checkpoints')
     parser.add_argument('--train-ratio', type=float, default=0.9)
-    parser.add_argument('--batch-size', type=int, default=32, help='input batch size for training')
+    parser.add_argument('--batch-size', type=int, default=64, help='input batch size for training')
     parser.add_argument('--test-batch-size', type=int, default=500, help='input batch size for testing')
     parser.add_argument('--epochs', type=int, default=10, help='number of epochs to train')
     args = parser.parse_args()

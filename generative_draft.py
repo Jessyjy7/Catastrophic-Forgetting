@@ -1,4 +1,6 @@
+#!/usr/bin/env python3
 import argparse
+import pickle
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -14,7 +16,7 @@ from torchvision.datasets import MNIST, CIFAR10, Flowers102
 ##############################################
 # 0) Dataset loader factory
 ##############################################
-def get_loader(dataset_name, batch_size):
+def get_loader(dataset_name, batch_size, shuffle=True):
     if dataset_name == "MNIST":
         in_ch, H, W = 1, 28, 28
         tf = transforms.ToTensor()
@@ -22,27 +24,22 @@ def get_loader(dataset_name, batch_size):
 
     elif dataset_name == "CIFAR10":
         in_ch, H, W = 3, 32, 32
-        tf = transforms.Compose([
-            transforms.ToTensor(),
-        ])
+        tf = transforms.Compose([ transforms.ToTensor() ])
         ds = CIFAR10("./data", train=True, download=True, transform=tf)
 
     elif dataset_name == "Flowers102":
         in_ch, H, W = 3, 64, 64
-        tf = transforms.Compose([
-            transforms.Resize((H, W)),
-            transforms.ToTensor(),
-        ])
+        tf = transforms.Compose([ transforms.Resize((H, W)), transforms.ToTensor() ])
         ds = Flowers102("./data", split="train", download=True, transform=tf)
 
     else:
         raise ValueError(f"Unknown dataset {dataset_name}")
 
     loader = torch.utils.data.DataLoader(
-        ds, batch_size=batch_size, shuffle=True,
+        ds, batch_size=batch_size, shuffle=shuffle,
         pin_memory=True, num_workers=4
     )
-    return loader, in_ch, H, W
+    return loader, in_ch, H, W, ds
 
 ##############################################
 # 1) HDC helper
@@ -134,7 +131,7 @@ class UNetAutoencoder(nn.Module):
             ResidualBlock(in_c)
         )
 
-        # latent
+        # latent projections
         self.flat_h, self.flat_w = h, w
         flat_ch = in_c * h * w
         self.to_latent   = nn.Linear(flat_ch, latent_dim)
@@ -181,7 +178,8 @@ def train_decoder_with_hdc(model, loader, hdc_dim, group_size, epochs, lr, devic
     optimizer = optim.Adam(
         list(model.from_latent.parameters()) +
         list(model.decoders.parameters()) +
-        list(model.final_conv.parameters()), lr=lr
+        list(model.final_conv.parameters()),
+        lr=lr
     )
 
     for epoch in range(1, epochs+1):
@@ -194,9 +192,10 @@ def train_decoder_with_hdc(model, loader, hdc_dim, group_size, epochs, lr, devic
 
             uniq, cnts = torch.unique(labels, return_counts=True)
             valid = uniq[cnts >= group_size]
-            if valid.numel() == 0: continue
+            if valid.numel() == 0:
+                continue
             cls  = valid[torch.randint(len(valid), (1,)).item()]
-            idxs = (labels==cls).nonzero(as_tuple=False).view(-1)
+            idxs = (labels == cls).nonzero(as_tuple=False).view(-1)
             sel  = idxs[torch.randperm(idxs.size(0))[:group_size]]
 
             grp = z_clean[sel]
@@ -204,7 +203,7 @@ def train_decoder_with_hdc(model, loader, hdc_dim, group_size, epochs, lr, devic
                 pad = torch.zeros((group_size, hdc_dim-ld), device=device)
                 grp = torch.cat([grp, pad], dim=1)
 
-            idx = torch.arange(group_size, device=device) % hdc_dim
+            idx    = torch.arange(group_size, device=device) % hdc_dim
             keys   = H[idx]
             bundle = (keys * grp).sum(dim=0)
             rec    = bundle.unsqueeze(0) * keys
@@ -238,7 +237,7 @@ def integration_pipeline(model, loader, hdc_dim, num_samples, device, out_path):
         pad = torch.zeros((num_samples, hdc_dim-ld), device=device)
         z   = torch.cat([z, pad], dim=1)
 
-    idx = torch.arange(num_samples, device=device) % hdc_dim
+    idx    = torch.arange(num_samples, device=device) % hdc_dim
     keys   = H[idx]
     bundle = (keys * z).sum(dim=0)
     rec    = bundle.unsqueeze(0) * keys
@@ -263,17 +262,62 @@ def integration_pipeline(model, loader, hdc_dim, num_samples, device, out_path):
     return score
 
 ##############################################
-# 5) Sweep experiment
+# 5) Create buffer: dump 50 decoded images/class
+##############################################
+def create_buffer(model, dataset_name, hdc_dim, device,
+                  per_class=50, output_file= "replay_buffer.pkl"):
+    loader, in_ch, H, W, ds = get_loader(dataset_name, batch_size=1, shuffle=False)
+    Hmat = generate_hadamard(hdc_dim, device)
+    model.eval()
+
+    # Determine number of classes
+    if hasattr(ds, "classes"):
+        num_classes = len(ds.classes)
+    else:
+        num_classes = int(max(ds.targets)) + 1
+
+    buffer = {c: [] for c in range(num_classes)}
+    counts = {c: 0 for c in range(num_classes)}
+
+    with torch.no_grad():
+        for img, label in loader:
+            c = int(label.item())
+            if counts[c] >= per_class:
+                if all(counts[k] >= per_class for k in counts):
+                    break
+                continue
+
+            x = img.to(device)
+            z, skips = model.encode(x)
+            if z.size(1) < hdc_dim:
+                pad = torch.zeros((1, hdc_dim - z.size(1)), device=device)
+                z = torch.cat([z, pad], dim=1)
+
+            key    = Hmat[:1]           # single-row key
+            bundle = (key * z).sum(dim=1, keepdim=True)
+            rec_h  = bundle * key
+            z_rec  = rec_h[:, :z.size(1)]
+            decoded = model.decode(z_rec, skips)
+
+            buffer[c].append(decoded.cpu().squeeze().numpy())
+            counts[c] += 1
+
+    with open(output_file, "wb") as f:
+        pickle.dump(buffer, f)
+    print(f"Saved {per_class} samples/class to {output_file}")
+
+##############################################
+# 6) Sweep experiment
 ##############################################
 def run_experiment(dataset_name, args):
-    loader, in_ch, H, W = get_loader(dataset_name, args.batch_size)
+    loader, in_ch, H, W, _ = get_loader(dataset_name, args.batch_size)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dims, scores = [2**k for k in range(3,15)], []
 
     for dim in tqdm(dims, desc=f"Sweeping {dataset_name}"):
         model = UNetAutoencoder(in_ch, args.base_ch, dim, H, W).to(device)
-        train_decoder_with_hdc(model, loader, dim, args.group_size,
-                               args.epochs, args.lr, device)
+        train_decoder_with_hdc(model, loader, dim,
+                               args.group_size, args.epochs, args.lr, device)
         out_path = f"{dataset_name}_recon_dim_{dim}.png"
         score = integration_pipeline(model, loader, dim,
                                      args.num_samples, device, out_path)
@@ -284,6 +328,7 @@ def run_experiment(dataset_name, args):
     plt.xscale('log', base=2)
     plt.xlabel('latent_dim')
     plt.ylabel('SSIM')
+    plt.ylim(0, 1)
     plt.title(f'{dataset_name}: latent_dim vs SSIM')
     plt.grid(True, which='both', ls='--', alpha=0.5)
     plt.tight_layout()
@@ -291,27 +336,34 @@ def run_experiment(dataset_name, args):
     print(f"→ Saved {dataset_name}_ssim_vs_latent_dim.png")
 
 ##############################################
-# 6) Main & Argparse
+# 7) Main & Argparse
 ##############################################
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=["MNIST","CIFAR10","Flowers102"], default="MNIST")
-    parser.add_argument("--mode",    choices=["single","sweep"], default="single")
-    parser.add_argument("--latent_dim", type=int,   default=128)
-    parser.add_argument("--base_ch",    type=int,   default=8)
-    parser.add_argument("--group_size", type=int,   default=10)
-    parser.add_argument("--epochs",     type=int,   default=5)
-    parser.add_argument("--batch_size", type=int,   default=64)
-    parser.add_argument("--lr",         type=float, default=1e-3)
-    parser.add_argument("--num_samples",type=int,   default=10)
-    parser.add_argument("--out_path",   type=str,   default="reconstruction.png")
+    parser.add_argument("--dataset",
+                        choices=["MNIST","CIFAR10","Flowers102"],
+                        default="MNIST")
+    parser.add_argument("--mode",
+                        choices=["single","sweep"],
+                        default="single",
+                        help="single: one run; sweep: latent_dim sweep")
+    parser.add_argument("--latent_dim",  type=int,   default=128)
+    parser.add_argument("--base_ch",     type=int,   default=8)
+    parser.add_argument("--group_size",  type=int,   default=10)
+    parser.add_argument("--epochs",      type=int,   default=5)
+    parser.add_argument("--batch_size",  type=int,   default=64)
+    parser.add_argument("--lr",          type=float, default=1e-3)
+    parser.add_argument("--num_samples", type=int,   default=10)
+    parser.add_argument("--out_path",    type=str,   default="reconstruction.png")
+    parser.add_argument("--create_buffer", action="store_true",
+                        help="Run HDC pipeline and save 50 decoded images/class")
     args = parser.parse_args()
 
-    if args.mode == "single":
-        loader, in_ch, H, W = get_loader(args.dataset, args.batch_size)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Running on {device} with {args.dataset}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on {device} with dataset={args.dataset}")
 
+    if args.mode == "single":
+        loader, in_ch, H, W, ds = get_loader(args.dataset, args.batch_size)
         model = UNetAutoencoder(in_ch, args.base_ch,
                                 args.latent_dim, H, W).to(device)
         print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
@@ -323,10 +375,16 @@ def main():
                                args.latent_dim, args.group_size,
                                args.epochs, args.lr, device)
 
-        print("→ Running integration pipeline …")
-        integration_pipeline(model, loader,
-                             args.latent_dim, args.num_samples,
-                             device, args.out_path)
+        if args.create_buffer:
+            create_buffer(model, args.dataset,
+                          args.latent_dim, device,
+                          per_class=50,
+                          output_file="replay_buffer.pkl")
+        else:
+            print("→ Running integration pipeline …")
+            integration_pipeline(model, loader,
+                                 args.latent_dim, args.num_samples,
+                                 device, args.out_path)
 
     else:
         run_experiment(args.dataset, args)

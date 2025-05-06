@@ -261,7 +261,7 @@ def integration_pipeline(model, loader, hdc_dim, num_samples, device, out_path):
 # 5) Create buffer: 50 decoded images/class
 ##############################################
 def create_buffer(model, dataset_name, hdc_dim, device,
-                  per_class=50, output_file= "replay_buffer.pkl"):
+                  per_class=100, output_file= "replay_buffer.pkl"):
     loader, in_ch, H, W, ds = get_loader(dataset_name, batch_size=1, shuffle=False)
     Hmat = generate_hadamard(hdc_dim, device)
     model.eval()
@@ -351,7 +351,7 @@ def main():
     parser.add_argument("--num_samples", type=int,   default=10)
     parser.add_argument("--out_path",    type=str,   default="reconstruction.png")
     parser.add_argument("--create_buffer", action="store_true",
-                        help="Run HDC pipeline and save 50 decoded images/class")
+                        help="Run HDC pipeline and save 100 decoded images/class")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

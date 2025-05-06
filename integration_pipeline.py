@@ -28,8 +28,7 @@ def generate_hadamard(n: int, device: torch.device) -> torch.Tensor:
     return H  # shape [n,n]
 
 ##############################################
-# (your U-Net / Residual / Attention blocks)
-# ———————— UNCHANGED ————————
+# U-Net / Residual / Attention blocks
 ##############################################
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
@@ -146,12 +145,10 @@ class UNetAutoencoder(nn.Module):
 # 4) HDC-Augmented Decoder Training (all on GPU)
 ##############################################
 def train_decoder_with_hdc(model, loader, hdc_dim, group_size, epochs, lr, device):
-    # freeze encoder & to_latent
     for p in model.encoders.parameters():  p.requires_grad = False
     for p in model.bottleneck.parameters(): p.requires_grad = False
     for p in model.to_latent.parameters(): p.requires_grad = False
 
-    # precompute Hadamard keys on GPU
     H = generate_hadamard(hdc_dim, device)
 
     criterion = nn.MSELoss()
@@ -168,12 +165,10 @@ def train_decoder_with_hdc(model, loader, hdc_dim, group_size, epochs, lr, devic
             images = images.to(device)
             labels = labels.to(device)
 
-            # get clean latents & skips
             with torch.no_grad():
                 z_clean, skips = model.encode(images)
             B, ld = z_clean.shape
 
-            # pick a class with ≥ group_size examples
             uniq, cnts = torch.unique(labels, return_counts=True)
             valid = uniq[cnts >= group_size]
             if valid.numel() == 0:
@@ -182,26 +177,21 @@ def train_decoder_with_hdc(model, loader, hdc_dim, group_size, epochs, lr, devic
             idxs = (labels == cls).nonzero(as_tuple=False).view(-1)
             sel  = idxs[torch.randperm(idxs.size(0))[:group_size]]
 
-            group = z_clean[sel]  # [G, ld]
+            group = z_clean[sel] 
 
-            # pad to hdc_dim if needed
             if ld < hdc_dim:
                 pad = torch.zeros((group_size, hdc_dim-ld), device=device)
                 group = torch.cat([group, pad], dim=1)
 
-            # binding & bundling
-            keys   = H[:group_size]           # [G, hdc_dim]
-            bound  = keys * group             # [G, hdc_dim]
-            bundle = bound.sum(dim=0)         # [hdc_dim]
+            keys   = H[:group_size]           
+            bound  = keys * group            
+            bundle = bound.sum(dim=0)        
 
-            # unbinding & recover
-            rec    = bundle.unsqueeze(0) * keys   # [G, hdc_dim]
-            z_noisy = rec[:, :ld]                 # [G, ld]
+            rec    = bundle.unsqueeze(0) * keys   
+            z_noisy = rec[:, :ld]                 
 
-            # slice skips
             sliced_skips = [skip[sel] for skip in skips]
 
-            # decode & optimize
             decoded = model.decode(z_noisy, sliced_skips)
             target  = images[sel]
             loss    = criterion(decoded, target)
@@ -215,7 +205,7 @@ def train_decoder_with_hdc(model, loader, hdc_dim, group_size, epochs, lr, devic
         print(f"[Epoch {epoch}/{epochs}] HDC-train loss: {avg:.4f}")
 
 ##############################################
-# 5) Integration + SSIM + Plot (all on GPU)
+# 5) Integration + SSIM + Plot 
 ##############################################
 def integration_pipeline(model, loader, hdc_dim, num_samples, device, out_path):
     model.eval()
@@ -232,12 +222,11 @@ def integration_pipeline(model, loader, hdc_dim, num_samples, device, out_path):
         pad = torch.zeros((num_samples, hdc_dim-ld), device=device)
         z   = torch.cat([z, pad], dim=1)
 
-    keys   = H[:num_samples]          # [S, hdc_dim]
-    bound  = keys * z                 # [S, hdc_dim]
-    bundle = bound.sum(dim=0)         # [hdc_dim]
-
-    rec    = bundle.unsqueeze(0) * keys  # [S, hdc_dim]
-    z_rec  = rec[:, :ld]                 # [S, ld]
+    keys   = H[:num_samples]          
+    bound  = keys * z                 
+    bundle = bound.sum(dim=0)         
+    rec    = bundle.unsqueeze(0) * keys  
+    z_rec  = rec[:, :ld]                 
 
     sliced_skips = [skip[:num_samples] for skip in skips]
     with torch.no_grad():
@@ -245,7 +234,6 @@ def integration_pipeline(model, loader, hdc_dim, num_samples, device, out_path):
         score   = ssim_func(images, decoded, data_range=1.0, size_average=True)
     print(f"Test SSIM: {score.item():.4f}")
 
-    # save comparison plot
     orig  = images.cpu().numpy()
     recon = decoded.cpu().numpy()
     fig, axes = plt.subplots(2, num_samples, figsize=(2*num_samples, 4))
@@ -276,13 +264,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(">>> Running on", device)
 
-    # data
     transform = transforms.ToTensor()
     ds    = torchvision.datasets.MNIST("./data", train=True, download=True, transform=transform)
     loader= torch.utils.data.DataLoader(ds, batch_size=args.batch_size, shuffle=True,
                                         pin_memory=True, num_workers=4)
 
-    # model
+   
     model = UNetAutoencoder(1, args.base_ch, args.latent_dim, 28, 28).to(device)
     print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
     
@@ -290,7 +277,6 @@ def main():
     param_mb    = param_bytes / (1024**2)
     print(f"Approximate model size (float32): {param_mb:.2f} MB")
 
-    # train HDC decoder
     print("→ Starting HDC-augmented decoder training …")
     train_decoder_with_hdc(model, loader,
                            hdc_dim    = args.latent_dim,
@@ -299,7 +285,6 @@ def main():
                            lr         = args.lr,
                            device     = device)
 
-    # run integration
     print("→ Running integration pipeline …")
     integration_pipeline(model, loader,
                          hdc_dim     = args.latent_dim,
@@ -308,7 +293,6 @@ def main():
                          out_path    = args.out_path)
     
 def run_experiment():
-    # fixed params
     base_ch    = 8
     group_size = 10
     epochs     = 10
@@ -319,7 +303,6 @@ def run_experiment():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("→ Running on", device)
 
-    # data
     ds     = torchvision.datasets.MNIST("./data", train=True, download=True,
                                         transform=transforms.ToTensor())
     loader = torch.utils.data.DataLoader(ds, batch_size=batch_size,
@@ -328,14 +311,11 @@ def run_experiment():
 
     dims, scores = [2**k for k in range(4,15)], []
     for dim in tqdm(dims, desc="Sweeping latent_dim"):
-        # build model
         model = UNetAutoencoder(1, base_ch, dim, 28, 28).to(device)
 
-        # train decoder w/ HDC
         print(f"\n→ Training (latent_dim={dim})")
         train_decoder_with_hdc(model, loader, dim, group_size, epochs, lr, device)
 
-        # test & save reconstructions
         print(f"→ Testing (latent_dim={dim})")
         H = generate_hadamard(dim, device)
         images, _ = next(iter(loader))
@@ -361,7 +341,6 @@ def run_experiment():
         print(f"  SSIM @ {dim}: {score:.4f}")
         scores.append(score)
 
-        # save this reconstruction
         orig, recon = images.cpu().numpy(), decoded.cpu().numpy()
         fig, axes = plt.subplots(2, num_samples, figsize=(2*num_samples,4))
         for i in range(num_samples):
@@ -372,7 +351,6 @@ def run_experiment():
         plt.savefig(f"reconstruction_dim_{dim}.png", dpi=150)
         plt.close(fig)
 
-    # final plot
     plt.figure(figsize=(8,5))
     plt.plot(dims, scores, marker='o')
     plt.xscale('log', base=2)

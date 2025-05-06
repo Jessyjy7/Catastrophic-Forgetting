@@ -288,7 +288,7 @@ def sequential_train_with_buffer_using_decoded(
             batch_size=args.batch_size,
             shuffle=True,
             pin_memory=True,
-            num_workers=0    # ← single‐process loader
+            num_workers=0
         )
 
         # 4) Train
@@ -505,8 +505,8 @@ def lifelong_learning_with_buffer_using_decoded(model, device, criterion, optimi
             print("No data for digit", digit)
             continue
 
-        combined_images_tensor = torch.cat(combined_images, dim=0)   # CPU
-        combined_labels_tensor = torch.stack(combined_labels)        # CPU
+        combined_images_tensor = torch.cat(combined_images, dim=0)   
+        combined_labels_tensor = torch.stack(combined_labels)        
         combined_dataset = TensorDataset(combined_images_tensor, combined_labels_tensor)
         combined_loader = DataLoader(combined_dataset, batch_size=args.batch_size, shuffle=True)
 
@@ -515,7 +515,6 @@ def lifelong_learning_with_buffer_using_decoded(model, device, criterion, optimi
         for epoch in range(args.epochs):
             running_loss = 0.0
             for data, target in combined_loader:
-                # Now move to GPU + replicate if mobilenet
                 if args.model == 'mobilenet':
                     data = replicate_channels(data)
                 data, target = data.to(device), target.to(device)
@@ -576,7 +575,6 @@ if __name__ == "__main__":
     # Create model
     if args.model == "mlp":
         from model_zoo.models import mlp
-        # Adjust input_dim if you flatten images, etc.
         model = mlp.MLP(input_dim=28*28, output_dim=out_classes)
     elif args.model == "lenet":
         model = models.LeNet(input_channels=1 if args.dataset=='mnist' else 3, out_classes=out_classes)
@@ -602,7 +600,6 @@ if __name__ == "__main__":
 
     print("\n===== Running Experiments =====")
 
-    # Example usage: pick whichever training function you want:
     # sequential_train_without_buffer(model, device, criterion, optimizer, args.epochs, test_loader, args, train_set)
     # sequential_train_with_buffer(model, device, criterion, optimizer, args.epochs, test_loader, args, train_set)
     sequential_train_with_buffer_using_decoded(model, device, criterion, optimizer, args.epochs, test_loader, args, train_set)

@@ -3,11 +3,8 @@ import argparse as ap
 import pickle
 import torch
 from hadamardHD import binding, unbinding
-# Replace the following with your actual UCI HAR data loader.
-# It should return a DataLoader for a given activity.
 from PYTORCHCNNS.model_zoo.datasets.ucihar_loader import get_activity_loader
 
-# Argument Parser
 parser = ap.ArgumentParser()
 parser.add_argument('-dataset', type=str, default="ucihar", help="Dataset name")
 parser.add_argument('-n', type=int, default=5, help="Number of encoded samples to bundle per activity")
@@ -67,40 +64,31 @@ def unbundle_and_decode(bundled_hvs, pseudo_inverse, D, n):
     
     return unbundled_activity_samples, decoded_activity_samples
 
-# Get list of activities (split by comma)
 activities = args.activities.split(",")
-# Load data for each activity using the provided loader
 activity_loaders = {activity: get_activity_loader(activity, batch_size=args.batch_size, train=args.train)
                     for activity in activities}
 activity_samples = {activity: next(iter(activity_loaders[activity])) for activity in activities}
 
-# Set up the random projection base matrix (using bipolar values)
 D = args.D  
 vector_len = args.vector_len  
 base_matrix = np.random.uniform(-1, 1, (D, vector_len))
 base_matrix = np.where(base_matrix >= 0, 1, -1)
 pseudo_inverse = np.linalg.pinv(base_matrix)
 
-# Encode the activity samples
 encoded_activity_samples = {}
 for activity in activities:
     features, _ = activity_samples[activity]
-    # Convert torch tensor to numpy and use only the first n samples per activity
     encoded_features = encoding_rp(features.numpy(), base_matrix, binary=False)
     encoded_activity_samples[activity] = encoded_features[:args.n]
 
-# Bundle the encoded samples using circular convolution binding
 bundled_hvs = bundle_encoded_samples(encoded_activity_samples, D, args.n)
 
-# Unbundle and decode the bundled hypervectors using circular correlation
 unbundled_activity_samples, decoded_activity_samples = unbundle_and_decode(bundled_hvs, pseudo_inverse, D, args.n)
 
-# Save the decoded replay buffer to a pickle file
 with open(args.output, "wb") as f:
     pickle.dump(decoded_activity_samples, f)
 print(f"Replay buffer saved to {args.output}")
 
-# After decoding and saving the pickle file, compare the original and decoded samples
 for activity in activities:
     features, _ = activity_samples[activity]
     original_samples = features.numpy()[:args.n]

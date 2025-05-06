@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse
 import pickle
 import torch
@@ -14,7 +13,7 @@ from tqdm import tqdm
 from torchvision.datasets import MNIST, CIFAR10, Flowers102
 
 ##############################################
-# 0) Dataset loader factory
+# 0) Dataset loader
 ##############################################
 def get_loader(dataset_name, batch_size, shuffle=True):
     if dataset_name == "MNIST":
@@ -116,14 +115,12 @@ class UNetAutoencoder(nn.Module):
             h //= 2; w //= 2; levels += 1
         self.levels = levels
 
-        # encoder
         self.encoders = nn.ModuleList()
         ch = base_ch; in_c = in_ch
         for _ in range(levels):
             self.encoders.append(EncoderBlock(in_c, ch))
             in_c = ch; ch *= 2
 
-        # bottleneck
         self.bottleneck = nn.Sequential(
             nn.Conv2d(in_c, in_c, 3, padding=1),
             nn.BatchNorm2d(in_c),
@@ -137,7 +134,6 @@ class UNetAutoencoder(nn.Module):
         self.to_latent   = nn.Linear(flat_ch, latent_dim)
         self.from_latent = nn.Linear(latent_dim, flat_ch)
 
-        # decoder
         self.decoders = nn.ModuleList()
         ch //= 2
         for _ in range(levels):
@@ -262,7 +258,7 @@ def integration_pipeline(model, loader, hdc_dim, num_samples, device, out_path):
     return score
 
 ##############################################
-# 5) Create buffer: dump 50 decoded images/class
+# 5) Create buffer: 50 decoded images/class
 ##############################################
 def create_buffer(model, dataset_name, hdc_dim, device,
                   per_class=50, output_file= "replay_buffer.pkl"):
@@ -270,7 +266,6 @@ def create_buffer(model, dataset_name, hdc_dim, device,
     Hmat = generate_hadamard(hdc_dim, device)
     model.eval()
 
-    # Determine number of classes
     if hasattr(ds, "classes"):
         num_classes = len(ds.classes)
     else:
@@ -293,7 +288,7 @@ def create_buffer(model, dataset_name, hdc_dim, device,
                 pad = torch.zeros((1, hdc_dim - z.size(1)), device=device)
                 z = torch.cat([z, pad], dim=1)
 
-            key    = Hmat[:1]           # single-row key
+            key    = Hmat[:1]           
             bundle = (key * z).sum(dim=1, keepdim=True)
             rec_h  = bundle * key
             z_rec  = rec_h[:, :z.size(1)]

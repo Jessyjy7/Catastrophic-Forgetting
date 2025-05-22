@@ -10,14 +10,21 @@ from pytorch_msssim import ssim as ssim_func
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-def get_full_dataset(name):
+# --- Updated to allow train/test splits
+def get_full_dataset(name, train=True):
     if name == "MNIST":
-        return MNIST("./data", train=True, download=True,
-                     transform=transforms.ToTensor())
+        return MNIST(
+            "./data", train=train, download=True,
+            transform=transforms.ToTensor()
+        )
     if name == "CIFAR10":
-        return CIFAR10("./data", train=True, download=True,
-                       transform=transforms.ToTensor())
+        return CIFAR10(
+            "./data", train=train, download=True,
+            transform=transforms.ToTensor()
+        )
     raise ValueError(f"Unsupported dataset {name}")
+
+# ... (rest of utility and block definitions remain unchanged) ...
 
 def generate_hadamard(n, device):
     H = torch.tensor([[1.]], device=device)
@@ -120,6 +127,8 @@ class UNetAutoencoder(nn.Module):
             out = dec(out, skip)
         return torch.sigmoid(self.final_conv(out))
 
+# --- train_decoder_with_hdc remains unchanged
+
 def train_decoder_with_hdc(model, loader, d, g, epochs, lr, dev):
     for p in model.encoders.parameters():    p.requires_grad = False
     for p in model.bottleneck.parameters():   p.requires_grad = False
@@ -157,10 +166,12 @@ def train_decoder_with_hdc(model, loader, d, g, epochs, lr, dev):
             loss = nn.MSELoss()(dec, x[sel])
             opt.zero_grad(); loss.backward(); opt.step()
 
-def evaluate_ssim_hdc(model, dataset_name, seen, num_samples, d, dev):
+# --- Updated to evaluate on unseen test data
+
+def evaluate_ssim_hdc(model, dataset, seen, num_samples, d, dev):
     model.eval()
     Hm = generate_hadamard(d, dev)
-    ds = get_full_dataset(dataset_name)
+    ds = dataset
     tot = 0.0
     for cls in seen:
         imgs = []
@@ -175,23 +186,28 @@ def evaluate_ssim_hdc(model, dataset_name, seen, num_samples, d, dev):
         B, ld = z.shape
         if ld < d:
             pad = torch.zeros((B, d-ld), device=dev)
-            z   = torch.cat([z, pad], dim=1)
-        key    = Hm[cls % d].unsqueeze(0)
-        bundle = z * key
-        rec    = bundle * key
-        z_rec  = rec[:, :ld]
-        skips2 = [s[:B] for s in skips]
+            z = torch.cat([z, pad], dim=1)
+        # perform g-way bundling to reflect training setting
+        g = num_samples
+        ids = torch.arange(g, device=dev) % d
+        ks  = Hm[ids]
+        bundle = (ks * z).sum(0)
+        recs   = bundle.unsqueeze(0) * ks
+        z_rec  = recs[:, :ld]
+        skips2 = [s[:g] for s in skips]
         with torch.no_grad():
             dec = model.decode(z_rec, skips2)
-            s   = ssim_func(batch, dec, data_range=1.0, size_average=True).item()
+            s = ssim_func(batch, dec, data_range=1.0, size_average=True).item()
         tot += s
     avg = tot / len(seen)
     print(f"{seen}: AvgSSIM {avg:.4f}")
 
-def plot_reconstructions_hdc(model, dataset_name, cls, num_samples, d, dev, out_path):
+# --- Updated to plot on test data
+
+def plot_reconstructions_hdc(model, dataset, cls, num_samples, d, dev, out_path):
     model.eval()
     Hm = generate_hadamard(d, dev)
-    ds = get_full_dataset(dataset_name)
+    ds = dataset
     imgs = []
     for x, y in ds:
         if y == cls:
@@ -204,70 +220,3 @@ def plot_reconstructions_hdc(model, dataset_name, cls, num_samples, d, dev, out_
     B, ld = z.shape
     if ld < d:
         pad = torch.zeros((B, d-ld), device=dev)
-        z   = torch.cat([z, pad], dim=1)
-    key    = Hm[cls % d].unsqueeze(0)
-    bundle = z * key
-    rec    = bundle * key
-    z_rec  = rec[:, :ld]
-    skips2 = [s[:B] for s in skips]
-    with torch.no_grad():
-        dec = model.decode(z_rec, skips2)
-    orig = batch.cpu().numpy()
-    recon = dec.cpu().numpy()
-    fig, axes = plt.subplots(2, num_samples, figsize=(2*num_samples, 4))
-    for i in range(num_samples):
-        axes[0, i].imshow(orig[i].transpose(1,2,0),
-                          cmap='gray' if orig.shape[1]==1 else None)
-        axes[0, i].axis('off')
-        axes[1, i].imshow(recon[i].transpose(1,2,0),
-                          cmap='gray' if recon.shape[1]==1 else None)
-        axes[1, i].axis('off')
-    axes[0, 0].set_title("Original")
-    axes[1, 0].set_title("Reconstructed")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset",    choices=["MNIST","CIFAR10"], default="CIFAR10")
-    parser.add_argument("--latent_dim", type=int, default=256)
-    parser.add_argument("--base_ch",    type=int, default=16)
-    parser.add_argument("--group_size", type=int, default=10)
-    parser.add_argument("--epochs",     type=int, default=5)
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--lr",         type=float, default=1e-3)
-    parser.add_argument("--num_samples",type=int, default=10)
-    args = parser.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ds = get_full_dataset(args.dataset)
-    labels = np.array(ds.targets)
-    num_classes = len(np.unique(labels))
-
-    in_ch = ds[0][0].shape[0]
-    H = ds[0][0].shape[1]; W = ds[0][0].shape[2]
-    model = UNetAutoencoder(in_ch, args.base_ch, args.latent_dim, H, W).to(device)
-
-    seen = []
-    for c in range(num_classes):
-        seen.append(c)
-        idx = np.where(labels == c)[0]
-        sub = Subset(ds, idx)
-        loader = DataLoader(sub, batch_size=args.batch_size,
-                            shuffle=True, pin_memory=True, num_workers=4)
-
-        train_decoder_with_hdc(model, loader,
-            args.latent_dim, args.group_size, args.epochs, args.lr, device)
-
-        evaluate_ssim_hdc(model, args.dataset,
-                          seen, args.num_samples,
-                          args.latent_dim, device)
-
-        plot_reconstructions_hdc(model, args.dataset,
-                                 c, args.num_samples,
-                                 args.latent_dim, device,
-                                 f"recon_class_{c}.png")
-
-if __name__ == "__main__":
-    main()

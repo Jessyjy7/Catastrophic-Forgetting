@@ -159,44 +159,75 @@ def train_decoder_with_hdc(m, loader, d, g, e, lr, dev):
             tl+=loss.item()
         print(f"{epoch}/{e} loss {tl/len(loader):.4f}")
 
-def integration_pipeline(m, loader, d, ns, dev, op):
-    m.eval(); Hm=generate_hadamard(d,dev)
-    x,_=next(iter(loader)); x=x.to(dev)[:ns]
-    with torch.no_grad(): z,sk=m.encode(x)
-    B,ld=z.shape
-    if ld<d: z=torch.cat([z,torch.zeros(ns,d-ld,device=dev)],1)
-    ids=torch.arange(ns,device=dev)%d; ks=Hm[ids]
-    bnd=(ks*z).sum(0); rec=bnd.unsqueeze(0)*ks; zr=rec[:,:ld]
-    sks=[s[:ns] for s in sk]
-    with torch.no_grad(): dec=m.decode(zr,sks)
-    sc=ssim_func(x,dec,data_range=1.0,size_average=True).item()
-    print(f"SSIM {sc:.4f}")
-    o, r = x.cpu().numpy(), dec.cpu().numpy()
-    fig,ax=plt.subplots(2,ns,figsize=(2*ns,4))
+def integration_pipeline(m, loader, d, ns, dev, out_path):
+    m.eval()
+    Hm = generate_hadamard(d, dev)
+    x, _ = next(iter(loader))
+    x = x.to(dev)[:ns]
+    with torch.no_grad():
+        z, skips = m.encode(x)
+    B, ld = z.shape
+    if ld < d:
+        z = torch.cat([z, torch.zeros(ns, d-ld, device=dev)], dim=1)
+    ids = torch.arange(ns, device=dev) % d
+    ks = Hm[ids]
+    bundle = (ks * z).sum(0)
+    rec = bundle.unsqueeze(0) * ks
+    zr = rec[:, :ld]
+    skips2 = [s[:ns] for s in skips]
+    with torch.no_grad():
+        dec = m.decode(zr, skips2)
+    sc = ssim_func(x, dec, data_range=1.0, size_average=True).item()
+    print(f"Test SSIM: {sc:.4f}")
+    orig = x.cpu().numpy(); recon = dec.cpu().numpy()
+    fig, ax = plt.subplots(2, ns, figsize=(2*ns, 4))
     for i in range(ns):
-        ax[0,i].imshow(o[i].transpose(1,2,0),cmap='gray' if o.shape[1]==1 else None); ax[0,i].axis('off')
-        ax[1,i].imshow(r[i].transpose(1,2,0),cmap='gray' if r.shape[1]==1 else None); ax[1,i].axis('off')
-    ax[0,0].set_title("Orig"); ax[1,0].set_title("Recon")
-    plt.tight_layout(); plt.savefig(op,dpi=150); plt.close(fig)
+        ax[0, i].imshow(orig[i].transpose(1,2,0),
+                         cmap='gray' if orig.shape[1]==1 else None)
+        ax[0, i].axis('off')
+        ax[1, i].imshow(recon[i].transpose(1,2,0),
+                         cmap='gray' if recon.shape[1]==1 else None)
+        ax[1, i].axis('off')
+    ax[0, 0].set_title("Original")
+    ax[1, 0].set_title("Reconstructed")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 def main():
-    p=argparse.ArgumentParser()
-    p.add_argument("--dataset",choices=["MNIST","CIFAR10"],default="MNIST")
-    p.add_argument("--latent_dim",type=int,default=128)
-    p.add_argument("--base_ch",type=int,default=8)
-    p.add_argument("--group_size",type=int,default=10)
-    p.add_argument("--epochs",type=int,default=10)
-    p.add_argument("--batch_size",type=int,default=64)
-    p.add_argument("--lr",type=float,default=1e-3)
-    p.add_argument("--num_samples",type=int,default=10)
-    p.add_argument("--out_path",type=str,default="recon.png")
-    a=p.parse_args()
-    dev=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    L,in_ch,H,W=get_loader(a.dataset,a.batch_size)
-    m=UNetAutoencoder(in_ch,a.base_ch,a.latent_dim,H,W).to(dev)
-    print(sum(pt.numel() for pt in m.parameters()))
-    train_decoder_with_hdc(m,L,a.latent_dim,a.group_size,a.epochs,a.lr,dev)
-    integration_pipeline(m,L,a.latent_dim,a.num_samples,dev,a.out_path)
+    p = argparse.ArgumentParser()
+    p.add_argument("--dataset", choices=["MNIST","CIFAR10"], default="MNIST")
+    p.add_argument("--latent_dim", type=int, default=128)
+    p.add_argument("--base_ch", type=int, default=8)
+    p.add_argument("--group_size", type=int, default=10)
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--num_samples", type=int, default=10)
+    p.add_argument("--out_path", type=str, default="recon.png")
+    args = p.parse_args()
 
-if __name__=="__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    train_loader, in_ch, H, W = get_loader(args.dataset, args.batch_size)
+
+    if args.dataset == "MNIST":
+        test_ds = MNIST("./data", train=False, download=True,
+                        transform=transforms.ToTensor())
+    else:
+        test_ds = CIFAR10("./data", train=False, download=True,
+                          transform=transforms.ToTensor())
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size,
+                             shuffle=False, pin_memory=True, num_workers=4)
+
+    m = UNetAutoencoder(in_ch, args.base_ch, args.latent_dim, H, W).to(device)
+    train_decoder_with_hdc(m, train_loader,
+                           args.latent_dim, args.group_size,
+                           args.epochs, args.lr, device)
+
+    integration_pipeline(m, test_loader,
+                         args.latent_dim, args.num_samples,
+                         device, args.out_path)
+
+if __name__ == "__main__":
     main()

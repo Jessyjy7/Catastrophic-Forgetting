@@ -10,7 +10,6 @@ from pytorch_msssim import ssim as ssim_func
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-# --- Dataset loader supporting train/test splits
 def get_full_dataset(name, train=True):
     if name == "MNIST":
         return MNIST(
@@ -24,7 +23,6 @@ def get_full_dataset(name, train=True):
         )
     raise ValueError(f"Unsupported dataset {name}")
 
-# --- Hadamard matrix generator
 def generate_hadamard(n, device):
     H = torch.tensor([[1.]], device=device)
     while H.shape[0] < n:
@@ -32,7 +30,6 @@ def generate_hadamard(n, device):
                        torch.cat([H, -H], dim=1)], dim=0)
     return H
 
-# --- UNet building blocks
 class ResidualBlock(nn.Module):
     def __init__(self, c):
         super().__init__()
@@ -127,7 +124,6 @@ class UNetAutoencoder(nn.Module):
             out = dec(out, skip)
         return torch.sigmoid(self.final_conv(out))
 
-# --- Train decoder on one-class loader with HDC bundling
 def train_decoder_with_hdc(model, loader, d, g, epochs, lr, dev):
     for p in model.encoders.parameters(): p.requires_grad = False
     for p in model.bottleneck.parameters(): p.requires_grad = False
@@ -143,7 +139,6 @@ def train_decoder_with_hdc(model, loader, d, g, epochs, lr, dev):
         for x, y in loader:
             x, y = x.to(dev), y.to(dev)
             with torch.no_grad(): zc, skips = model.encode(x)
-            # select a group of g samples for one class
             u, cnt = torch.unique(y, return_counts=True)
             v = u[cnt >= g]
             if v.numel() == 0: continue
@@ -165,7 +160,6 @@ def train_decoder_with_hdc(model, loader, d, g, epochs, lr, dev):
             loss = nn.MSELoss()(dec, x_sel)
             opt.zero_grad(); loss.backward(); opt.step()
 
-# --- Evaluate SSIM per class on HDC-bundled test data
 def evaluate_ssim_hdc(model, dataset, seen, num_samples, d, dev):
     model.eval()
     Hm = generate_hadamard(d, dev)
@@ -198,7 +192,6 @@ def evaluate_ssim_hdc(model, dataset, seen, num_samples, d, dev):
     print(f"Mean SSIM across seen classes: {mean_ssim:.4f}")
     return per_class_ssim
 
-# --- Plot reconstructions for a given class on test split
 def plot_reconstructions_hdc(model, dataset, cls, num_samples, d, dev, out_path):
     model.eval()
     Hm = generate_hadamard(d, dev)
@@ -231,7 +224,6 @@ def plot_reconstructions_hdc(model, dataset, cls, num_samples, d, dev, out_path)
     ax[0,0].set_title('Original'); ax[1,0].set_title('Reconstructed')
     plt.tight_layout(); plt.savefig(out_path, dpi=150); plt.close(fig)
 
-# --- Main: incremental per-class train, test on seen classes
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["MNIST","CIFAR10"], default="CIFAR10")
@@ -247,38 +239,30 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load train and test splits
     train_ds = get_full_dataset(args.dataset, train=True)
     test_ds  = get_full_dataset(args.dataset, train=False)
     in_ch = train_ds[0][0].shape[0]
     H = train_ds[0][0].shape[1]; W = train_ds[0][0].shape[2]
 
-    # Instantiate model
     model = UNetAutoencoder(in_ch, args.base_ch,
                             args.latent_dim, H, W).to(device)
 
-    # Prepare test labels
     test_labels = np.array(test_ds.targets)
     num_classes = len(np.unique(test_labels))
 
-    # Incremental training: one class at a time
     seen = []
     for c in range(num_classes):
         print(f"\n=== Training on class {c} ===")
         seen.append(c)
-        # per-class train loader
         idxs = np.where(np.array(train_ds.targets) == c)[0]
         loader_c = DataLoader(Subset(train_ds, idxs),
                               batch_size=args.batch_size,
                               shuffle=True, pin_memory=True, num_workers=4)
-        # train decoder on class c
         train_decoder_with_hdc(model, loader_c,
                                args.latent_dim, args.group_size,
                                args.epochs, args.lr, device)
-        # evaluate on test split for seen classes
         evaluate_ssim_hdc(model, test_ds, seen,
                           args.num_samples, args.latent_dim, device)
-        # plot reconstructions for current class
         plot_reconstructions_hdc(
             model, test_ds, c, args.num_samples,
             args.latent_dim, device,

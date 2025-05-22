@@ -129,7 +129,6 @@ class UNetAutoencoder(nn.Module):
 
 # --- Train decoder on one-class loader with HDC bundling
 def train_decoder_with_hdc(model, loader, d, g, epochs, lr, dev):
-    # freeze encoder
     for p in model.encoders.parameters(): p.requires_grad = False
     for p in model.bottleneck.parameters(): p.requires_grad = False
     for p in model.to_latent.parameters(): p.requires_grad = False
@@ -144,50 +143,40 @@ def train_decoder_with_hdc(model, loader, d, g, epochs, lr, dev):
         for x, y in loader:
             x, y = x.to(dev), y.to(dev)
             with torch.no_grad(): zc, skips = model.encode(x)
-            # select one class with >=g samples in batch
-def unique_batch(zc, skips, x, y, Hm, d, g, dev):
-    u, cnt = torch.unique(y, return_counts=True)
-    v = u[cnt >= g]
-    if v.numel() == 0:
-        return None, None, None
-    cls = v[torch.randint(len(v), (1,)).item()]
-    idx = (y == cls).nonzero(as_tuple=False).view(-1)
-    sel = idx[torch.randperm(idx.size(0))[:g]]
-    grp = zc[sel]
-    if grp.shape[1] < d:
-        pad = torch.zeros((g, d-grp.shape[1]), device=dev)
-        grp = torch.cat([grp, pad], dim=1)
-    ids = torch.arange(g, device=dev) % d
-    ks  = Hm[ids]
-    bundle = (ks * grp).sum(0)
-    recs   = bundle.unsqueeze(0) * ks
-    zn     = recs[:, :grp.shape[1]]
-    skips_sel = [s[sel] for s in skips]
-    x_sel = x[sel]
-    return zn, skips_sel, x_sel
-
-    for _ in range(epochs):
-        for x, y in loader:
-            x, y = x.to(dev), y.to(dev)
-            with torch.no_grad(): zc, skips = model.encode(x)
-            res = unique_batch(zc, skips, x, y, Hm, d, g, dev)
-            if res[0] is None: continue
-            zn, skips_sel, x_sel = res
+            # select a group of g samples for one class
+            u, cnt = torch.unique(y, return_counts=True)
+            v = u[cnt >= g]
+            if v.numel() == 0: continue
+            cls = v[torch.randint(len(v), (1,)).item()]
+            idx = (y == cls).nonzero(as_tuple=False).view(-1)
+            sel = idx[torch.randperm(idx.size(0))[:g]]
+            grp = zc[sel]
+            if grp.shape[1] < d:
+                pad = torch.zeros((g, d-grp.shape[1]), device=dev)
+                grp = torch.cat([grp, pad], dim=1)
+            ids = torch.arange(g, device=dev) % d
+            ks  = Hm[ids]
+            bundle = (ks * grp).sum(0)
+            recs   = bundle.unsqueeze(0) * ks
+            zn     = recs[:, :grp.shape[1]]
+            skips_sel = [s[sel] for s in skips]
+            x_sel = x[sel]
             dec = model.decode(zn, skips_sel)
             loss = nn.MSELoss()(dec, x_sel)
             opt.zero_grad(); loss.backward(); opt.step()
 
-# --- Evaluate SSIM on HDC-bundled test data for seen classes
+# --- Evaluate SSIM per class on HDC-bundled test data
 def evaluate_ssim_hdc(model, dataset, seen, num_samples, d, dev):
     model.eval()
     Hm = generate_hadamard(d, dev)
-    tot = 0.0
+    per_class_ssim = {}
     for cls in seen:
         imgs = []
         for x, y in dataset:
             if y == cls:
                 imgs.append(x)
-                if len(imgs) >= num_samples: break
+                if len(imgs) >= num_samples:
+                    break
         batch = torch.stack(imgs).to(dev)
         with torch.no_grad(): z, skips = model.encode(batch)
         B, ld = z.shape
@@ -202,9 +191,12 @@ def evaluate_ssim_hdc(model, dataset, seen, num_samples, d, dev):
         z_rec = recs[:, :ld]
         skips2 = [s[:g] for s in skips]
         with torch.no_grad(): dec = model.decode(z_rec, skips2)
-        tot += ssim_func(batch, dec, data_range=1.0, size_average=True).item()
-    avg = tot / len(seen)
-    print(f"Test classes {seen}: Avg SSIM = {avg:.4f}")
+        s = ssim_func(batch, dec, data_range=1.0, size_average=True).item()
+        per_class_ssim[cls] = s
+        print(f"Class {cls}: SSIM = {s:.4f}")
+    mean_ssim = sum(per_class_ssim.values()) / len(per_class_ssim)
+    print(f"Mean SSIM across seen classes: {mean_ssim:.4f}")
+    return per_class_ssim
 
 # --- Plot reconstructions for a given class on test split
 def plot_reconstructions_hdc(model, dataset, cls, num_samples, d, dev, out_path):

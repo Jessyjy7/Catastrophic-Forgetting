@@ -5,12 +5,12 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision.transforms as transforms
 from torchvision.datasets import MNIST, CIFAR10
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from pytorch_msssim import ssim as ssim_func
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-# --- Dataset loader with train/test split
+# --- Dataset loader supporting train/test splits
 def get_full_dataset(name, train=True):
     if name == "MNIST":
         return MNIST(
@@ -24,7 +24,7 @@ def get_full_dataset(name, train=True):
         )
     raise ValueError(f"Unsupported dataset {name}")
 
-# --- Hadamard generator
+# --- Hadamard matrix generator
 def generate_hadamard(n, device):
     H = torch.tensor([[1.]], device=device)
     while H.shape[0] < n:
@@ -127,9 +127,9 @@ class UNetAutoencoder(nn.Module):
             out = dec(out, skip)
         return torch.sigmoid(self.final_conv(out))
 
-# --- Training with HDC bundling
-
+# --- Train decoder on one-class loader with HDC bundling
 def train_decoder_with_hdc(model, loader, d, g, epochs, lr, dev):
+    # freeze encoder
     for p in model.encoders.parameters(): p.requires_grad = False
     for p in model.bottleneck.parameters(): p.requires_grad = False
     for p in model.to_latent.parameters(): p.requires_grad = False
@@ -137,35 +137,47 @@ def train_decoder_with_hdc(model, loader, d, g, epochs, lr, dev):
     opt = optim.Adam(
         list(model.from_latent.parameters()) +
         list(model.decoders.parameters()) +
-        list(model.final_conv.parameters()), lr=lr)
+        list(model.final_conv.parameters()), lr=lr
+    )
     model.train()
     for _ in range(epochs):
         for x, y in loader:
             x, y = x.to(dev), y.to(dev)
             with torch.no_grad(): zc, skips = model.encode(x)
-            B, ld = zc.shape
-            u, cnt = torch.unique(y, return_counts=True)
-            v = u[cnt >= g]
-            if v.numel() == 0: continue
-            cls = v[torch.randint(len(v), (1,)).item()]
-            idx = (y == cls).nonzero(as_tuple=False).view(-1)
-            sel = idx[torch.randperm(idx.size(0))[:g]]
-            grp = zc[sel]
-            if ld < d:
-                pad = torch.zeros((g, d-ld), device=dev)
-                grp = torch.cat([grp, pad], dim=1)
-            ids = torch.arange(g, device=dev) % d
-            ks = Hm[ids]
-            bundle = (ks * grp).sum(0)
-            recs = bundle.unsqueeze(0) * ks
-            zn = recs[:, :ld]
-            skips_sel = [s[sel] for s in skips]
+            # select one class with >=g samples in batch
+def unique_batch(zc, skips, x, y, Hm, d, g, dev):
+    u, cnt = torch.unique(y, return_counts=True)
+    v = u[cnt >= g]
+    if v.numel() == 0:
+        return None, None, None
+    cls = v[torch.randint(len(v), (1,)).item()]
+    idx = (y == cls).nonzero(as_tuple=False).view(-1)
+    sel = idx[torch.randperm(idx.size(0))[:g]]
+    grp = zc[sel]
+    if grp.shape[1] < d:
+        pad = torch.zeros((g, d-grp.shape[1]), device=dev)
+        grp = torch.cat([grp, pad], dim=1)
+    ids = torch.arange(g, device=dev) % d
+    ks  = Hm[ids]
+    bundle = (ks * grp).sum(0)
+    recs   = bundle.unsqueeze(0) * ks
+    zn     = recs[:, :grp.shape[1]]
+    skips_sel = [s[sel] for s in skips]
+    x_sel = x[sel]
+    return zn, skips_sel, x_sel
+
+    for _ in range(epochs):
+        for x, y in loader:
+            x, y = x.to(dev), y.to(dev)
+            with torch.no_grad(): zc, skips = model.encode(x)
+            res = unique_batch(zc, skips, x, y, Hm, d, g, dev)
+            if res[0] is None: continue
+            zn, skips_sel, x_sel = res
             dec = model.decode(zn, skips_sel)
-            loss = nn.MSELoss()(dec, x[sel])
+            loss = nn.MSELoss()(dec, x_sel)
             opt.zero_grad(); loss.backward(); opt.step()
 
-# --- Evaluation on unseen test data
-
+# --- Evaluate SSIM on HDC-bundled test data for seen classes
 def evaluate_ssim_hdc(model, dataset, seen, num_samples, d, dev):
     model.eval()
     Hm = generate_hadamard(d, dev)
@@ -190,13 +202,11 @@ def evaluate_ssim_hdc(model, dataset, seen, num_samples, d, dev):
         z_rec = recs[:, :ld]
         skips2 = [s[:g] for s in skips]
         with torch.no_grad(): dec = model.decode(z_rec, skips2)
-        s = ssim_func(batch, dec, data_range=1.0, size_average=True).item()
-        tot += s
+        tot += ssim_func(batch, dec, data_range=1.0, size_average=True).item()
     avg = tot / len(seen)
     print(f"Test classes {seen}: Avg SSIM = {avg:.4f}")
 
-# --- Plot reconstructions from test set
-
+# --- Plot reconstructions for a given class on test split
 def plot_reconstructions_hdc(model, dataset, cls, num_samples, d, dev, out_path):
     model.eval()
     Hm = generate_hadamard(d, dev)
@@ -229,7 +239,7 @@ def plot_reconstructions_hdc(model, dataset, cls, num_samples, d, dev, out_path)
     ax[0,0].set_title('Original'); ax[1,0].set_title('Reconstructed')
     plt.tight_layout(); plt.savefig(out_path, dpi=150); plt.close(fig)
 
-# --- Main execution
+# --- Main: incremental per-class train, test on seen classes
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["MNIST","CIFAR10"], default="CIFAR10")
@@ -245,28 +255,38 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Training on full train split
+    # Load train and test splits
     train_ds = get_full_dataset(args.dataset, train=True)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                              shuffle=True, pin_memory=True, num_workers=4)
+    test_ds  = get_full_dataset(args.dataset, train=False)
     in_ch = train_ds[0][0].shape[0]
     H = train_ds[0][0].shape[1]; W = train_ds[0][0].shape[2]
 
+    # Instantiate model
     model = UNetAutoencoder(in_ch, args.base_ch,
                             args.latent_dim, H, W).to(device)
-    train_decoder_with_hdc(model, train_loader,
-                           args.latent_dim, args.group_size,
-                           args.epochs, args.lr, device)
 
-    # Prepare test split for evaluation
-    test_ds = get_full_dataset(args.dataset, train=False)
-    labels = np.array(test_ds.targets)
-    seen = list(range(len(np.unique(labels))))
+    # Prepare test labels
+    test_labels = np.array(test_ds.targets)
+    num_classes = len(np.unique(test_labels))
 
-    # Evaluate and plot per class
-    evaluate_ssim_hdc(model, test_ds, seen,
-                      args.num_samples, args.latent_dim, device)
-    for c in seen:
+    # Incremental training: one class at a time
+    seen = []
+    for c in range(num_classes):
+        print(f"\n=== Training on class {c} ===")
+        seen.append(c)
+        # per-class train loader
+        idxs = np.where(np.array(train_ds.targets) == c)[0]
+        loader_c = DataLoader(Subset(train_ds, idxs),
+                              batch_size=args.batch_size,
+                              shuffle=True, pin_memory=True, num_workers=4)
+        # train decoder on class c
+        train_decoder_with_hdc(model, loader_c,
+                               args.latent_dim, args.group_size,
+                               args.epochs, args.lr, device)
+        # evaluate on test split for seen classes
+        evaluate_ssim_hdc(model, test_ds, seen,
+                          args.num_samples, args.latent_dim, device)
+        # plot reconstructions for current class
         plot_reconstructions_hdc(
             model, test_ds, c, args.num_samples,
             args.latent_dim, device,

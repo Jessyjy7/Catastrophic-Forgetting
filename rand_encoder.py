@@ -7,6 +7,8 @@ import torchvision.transforms as transforms
 from torchvision.datasets import CIFAR10, MNIST
 from torch.utils.data import DataLoader, Subset
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from pytorch_msssim import ssim as ssim_func
 
 def get_full_dataset(name, train=True):
     if name == "MNIST":
@@ -147,6 +149,42 @@ def train_decoder_without_hdc(model, loader, epochs, lr, dev):
             loss.backward()
             opt.step()
 
+
+def evaluate_ssim_no_hdc(model, dataset, num_classes, num_samples, dev):
+    model.eval()
+    per_class_ssim = {}
+    for cls in range(num_classes):
+        imgs = []
+        for x, y in dataset:
+            if y == cls:
+                imgs.append(x)
+                if len(imgs) >= num_samples:
+                    break
+        batch = torch.stack(imgs).to(dev)
+        with torch.no_grad():
+            z, skips = model.encode(batch)
+            dec = model.decode(z, skips)
+        s = ssim_func(batch, dec, data_range=1.0, size_average=True).item()
+        per_class_ssim[cls] = s
+        print(f"Class {cls}: SSIM = {s:.4f}")
+        orig = batch.cpu().numpy()
+        recon = dec.cpu().numpy()
+        fig, ax = plt.subplots(2, num_samples, figsize=(2*num_samples, 4))
+        for i in range(num_samples):
+            ax[0,i].imshow(orig[i].transpose(1,2,0),
+                           cmap='gray' if orig.shape[1]==1 else None)
+            ax[0,i].axis('off')
+            ax[1,i].imshow(recon[i].transpose(1,2,0),
+                           cmap='gray' if recon.shape[1]==1 else None)
+            ax[1,i].axis('off')
+        ax[0,0].set_title('Original'); ax[1,0].set_title('Reconstructed')
+        plt.tight_layout()
+        plt.show()
+    mean_ssim = sum(per_class_ssim.values()) / len(per_class_ssim)
+    print(f"Mean SSIM: {mean_ssim:.4f}")
+    return per_class_ssim
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["MNIST","CIFAR10"], default="CIFAR10")
@@ -155,6 +193,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--num_samples", type=int, default=10)
     args = parser.parse_args()
 
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -172,7 +211,7 @@ def main():
                             args.latent_dim, H, W).to(dev)
 
     num_classes = len(np.unique(np.array(train_ds.targets)))
-    encoder_history = []  
+    encoder_history = [] 
 
     for c in range(num_classes):
         print(f"\n=== Training on class {c} (no HDC) ===")
@@ -189,6 +228,10 @@ def main():
             first5 = w[:5].tolist()
             encoder_history.append(first5)
             print(f"Encoder weights after class {c}: {first5}")
+
+        print(f"\n--- Evaluation after training class {c} ---")
+        evaluate_ssim_no_hdc(model, test_ds, num_classes,
+                             args.num_samples, dev)
 
     print("\n=== Encoder weight changes over classes ===")
     for i, ws in enumerate(encoder_history):

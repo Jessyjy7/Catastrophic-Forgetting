@@ -52,11 +52,12 @@ class DecoderBlock(nn.Module):
         self.up = nn.ConvTranspose2d(ic, oc, 2, stride=2)
         self.res = ResidualBlock(oc)
         self.att = AttentionBlock(oc)
-        self.conv = nn.Conv2d(oc, oc, 3, padding=1)
-    def forward(self, x, skip=None):
+        self.conv = nn.Conv2d(oc + sc, oc, 3, padding=1)
+    def forward(self, x, skip):
         x = self.up(x)
         x = self.res(x)
         x = self.att(x)
+        x = torch.cat([x, skip], dim=1)
         return F.relu(self.conv(x))
 
 class UNetAutoencoder(nn.Module):
@@ -91,11 +92,11 @@ class UNetAutoencoder(nn.Module):
         B, C, hh, ww = out.shape
         flat = out.view(B, -1)
         return self.to_latent(flat), skips
-    def decode(self, z, skips=None):
+    def decode(self, z, skips):
         B = z.size(0)
         out = self.from_latent(z).view(B, -1, self.flat_h, self.flat_w)
-        for dec in self.decoders:
-            out = dec(out)
+        for dec, skip in zip(self.decoders, reversed(skips)):
+            out = dec(out, skip)
         return torch.sigmoid(self.final_conv(out))
 
 def train_decoder_without_hdc(model, loader, epochs, lr, dev):
@@ -108,14 +109,12 @@ def train_decoder_without_hdc(model, loader, epochs, lr, dev):
     for _ in range(epochs):
         for x, _ in loader:
             x = x.to(dev)
-            with torch.no_grad(): zc, _ = model.encode(x)
-            dec = model.decode(zc)
+            with torch.no_grad(): zc, skips = model.encode(x)
+            dec = model.decode(zc, skips)
             loss = criterion(dec, x)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+            opt.zero_grad(); loss.backward(); opt.step()
 
-def evaluate_ssim_no_skip(model, dataset, num_classes, num_samples, out_dir, dev):
+def evaluate_ssim_no_hdc(model, dataset, num_classes, num_samples, out_dir, dev):
     model.eval()
     per_class_ssim = {}
     for cls in range(num_classes):
@@ -126,7 +125,7 @@ def evaluate_ssim_no_skip(model, dataset, num_classes, num_samples, out_dir, dev
                 if len(imgs) >= num_samples:
                     break
         batch = torch.stack(imgs).to(dev)
-        with torch.no_grad(): z, _ = model.encode(batch); dec = model.decode(z)
+        with torch.no_grad(): z, skips = model.encode(batch); dec = model.decode(z, skips)
         s = ssim_func(batch, dec, data_range=1.0, size_average=True).item()
         per_class_ssim[cls] = s
         print(f"Class {cls}: SSIM = {s:.4f}")
@@ -154,17 +153,25 @@ def main():
     args = parser.parse_args()
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_ds = (MNIST if args.dataset=="MNIST" else CIFAR10)("./data", train=True, download=True, transform=transforms.ToTensor())
-    test_ds = (MNIST if args.dataset=="MNIST" else CIFAR10)("./data", train=False, download=True, transform=transforms.ToTensor())
-    in_ch = train_ds[0][0].shape[0]; H, W = train_ds[0][0].shape[1:]
+    test_ds  = (MNIST if args.dataset=="MNIST" else CIFAR10)("./data", train=False, download=True, transform=transforms.ToTensor())
+    in_ch = train_ds[0][0].shape[0]
+    H, W = train_ds[0][0].shape[1:]
     model = UNetAutoencoder(in_ch, args.base_ch, args.latent_dim, H, W).to(dev)
+    num_params = sum(p.numel() for p in model.parameters())
+    size_kb = num_params * 4 / 1024
+    print(f"Model parameters: {num_params:,} ({num_params/1e6:.2f}M)")
+    print(f"Approximate model size: {size_kb:.2f} KB")
     num_classes = len(np.unique(np.array(train_ds.targets)))
     for c in range(num_classes):
         print(f"\n=== Training on class {c} ===")
         idxs = np.where(np.array(train_ds.targets)==c)[0]
         loader_c = DataLoader(Subset(train_ds, idxs), batch_size=args.batch_size, shuffle=True, num_workers=4)
         train_decoder_without_hdc(model, loader_c, args.epochs, args.lr, dev)
-        with torch.no_grad(): w = model.encoders[0].conv[0].weight.data.cpu().flatten(); print(f"Enc weights[:5] after class {c}: {w[:5].tolist()}")
+        with torch.no_grad():
+            w = model.encoders[0].conv[0].weight.data.cpu().flatten()
+            print(f"Enc weights[:5] after class {c}: {w[:5].tolist()}")
         print(f"\n--- Eval after class {c} ---")
-        evaluate_ssim_no_skip(model, test_ds, num_classes, args.num_samples, args.out_dir, dev)
+        evaluate_ssim_no_hdc(model, test_ds, num_classes, args.num_samples, args.out_dir, dev)
+
 if __name__ == "__main__":
     main()

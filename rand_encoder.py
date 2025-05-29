@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision.transforms as transforms
-from torchvision.datasets import CIFAR10, MNIST
+from torchvision.datasets import CIFAR100, CIFAR10, MNIST
 from torch.utils.data import DataLoader, Subset
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -15,6 +15,8 @@ def get_full_dataset(name, train=True):
         return MNIST("./data", train=train, download=True, transform=transforms.ToTensor())
     if name == "CIFAR10":
         return CIFAR10("./data", train=train, download=True, transform=transforms.ToTensor())
+    if name == "CIFAR100":
+        return CIFAR100("./data", train=train, download=True, transform=transforms.ToTensor())
     raise ValueError("Unsupported dataset")
 
 class ResidualBlock(nn.Module):
@@ -51,7 +53,7 @@ class EncoderBlock(nn.Module):
     def forward(self, x):
         skip = self.conv(x)
         down = self.pool(skip)
-        return skip, down
+        return down
 
 class DecoderBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
@@ -60,11 +62,11 @@ class DecoderBlock(nn.Module):
         self.res  = ResidualBlock(out_ch)
         self.att  = AttentionBlock(out_ch)
         self.conv = nn.Conv2d(out_ch*2, out_ch, 3, padding=1)
-    def forward(self, x, skip):
+        self.conv = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+    def forward(self, x):
         x = self.up(x)
         x = self.res(x)
         x = self.att(x)
-        x = torch.cat([x, skip], dim=1)
         return F.relu(self.conv(x))
 
 class UNetAutoencoder(nn.Module):
@@ -100,42 +102,44 @@ class UNetAutoencoder(nn.Module):
         for _ in range(levels):
             self.decoders.append(DecoderBlock(in_c, ch))
             in_c = ch; ch //= 2
-
         self.final_conv = nn.Conv2d(in_c, in_ch, 1)
 
     def encode(self, x):
-        skips, out = [], x
+        out = x
         for enc in self.encoders:
-            skip, out = enc(out)
-            skips.append(skip)
+            out = enc(out)
         out = self.bottleneck(out)
         B, C, H, W = out.shape
         flat = out.view(B, -1)
         z    = self.to_latent(flat)
-        return z, skips
+        return z
 
-    def decode(self, z, skips):
+    def decode(self, z):
         B = z.size(0)
         flat = self.from_latent(z)
         out  = flat.view(B, -1, self.flat_h, self.flat_w)
-        for dec, skip in zip(self.decoders, reversed(skips)):
-            out = dec(out, skip)
+        for dec in self.decoders:
+            out = dec(out)
         return torch.sigmoid(self.final_conv(out))
 
 def train_decoder_without_hdc(model, loader, epochs, lr, dev):
     for p in model.encoders.parameters(): p.requires_grad = False
     for p in model.bottleneck.parameters(): p.requires_grad = False
     for p in model.to_latent.parameters(): p.requires_grad = False
-    opt = optim.Adam(list(model.from_latent.parameters()) + list(model.decoders.parameters()) + list(model.final_conv.parameters()), lr=lr)
+    opt = optim.Adam(list(model.from_latent.parameters()) + 
+                     list(model.decoders.parameters()) + 
+                     list(model.final_conv.parameters()), lr=lr)
     criterion = nn.MSELoss()
     model.train()
     for _ in range(epochs):
-        for x, _ in loader:
+        for x, y in loader:
             x = x.to(dev)
-            with torch.no_grad(): zc, skips = model.encode(x)
-            dec = model.decode(zc, skips)
+            opt.zero_grad()
+            zc = model.encode(x)
+            dec = model.decode(zc)
             loss = criterion(dec, x)
-            opt.zero_grad(); loss.backward(); opt.step()
+            loss.backward(); 
+            opt.step()
 
 def evaluate_ssim_no_hdc(model, dataset, num_classes, num_samples, out_dir, dev):
     model.eval()
@@ -148,7 +152,9 @@ def evaluate_ssim_no_hdc(model, dataset, num_classes, num_samples, out_dir, dev)
                 if len(imgs) >= num_samples:
                     break
         batch = torch.stack(imgs).to(dev)
-        with torch.no_grad(): z, skips = model.encode(batch); dec = model.decode(z, skips)
+        with torch.no_grad():
+            z = model.encode(batch)
+            dec = model.decode(z)
         s = ssim_func(batch, dec, data_range=1.0, size_average=True).item()
         per_class_ssim[cls] = s
         print(f"Class {cls}: SSIM = {s:.4f}")
@@ -158,25 +164,35 @@ def evaluate_ssim_no_hdc(model, dataset, num_classes, num_samples, out_dir, dev)
             ax[0,i].imshow(orig[i].transpose(1,2,0), cmap='gray' if orig.shape[1]==1 else None); ax[0,i].axis('off')
             ax[1,i].imshow(recon[i].transpose(1,2,0), cmap='gray' if recon.shape[1]==1 else None); ax[1,i].axis('off')
         ax[0,0].set_title('Orig'); ax[1,0].set_title('Recon')
-        plt.tight_layout(); plt.savefig(f"{out_dir}/recon_class_{cls}.png", dpi=150); plt.close(fig)
+        plt.tight_layout(); plt.savefig(f"{out_dir}img/recon_class_{cls}.png", dpi=150); plt.close(fig)
     mean_ssim = sum(per_class_ssim.values()) / len(per_class_ssim)
     print(f"Mean SSIM: {mean_ssim:.4f}")
     return per_class_ssim
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=["MNIST","CIFAR10"], default="CIFAR10")
+    parser.add_argument("--dataset", choices=["MNIST","CIFAR10", "CIFAR100"], default="CIFAR10")
     parser.add_argument("--latent_dim", type=int, default=256)
     parser.add_argument("--base_ch", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--out_dir", type=str, default="./")
     args = parser.parse_args()
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_ds = (MNIST if args.dataset=="MNIST" else CIFAR10)("./data", train=True, download=True, transform=transforms.ToTensor())
-    test_ds  = (MNIST if args.dataset=="MNIST" else CIFAR10)("./data", train=False, download=True, transform=transforms.ToTensor())
+    if args.dataset == "MNIST":
+        train_ds = MNIST("./data", train=True, download=True, transform=transforms.ToTensor())
+        test_ds = MNIST("./data", train=False, download=True, transform=transforms.ToTensor())
+    if args.dataset == "CIFAR10":
+        train_ds = CIFAR10("./data", train=True, download=True, transform=transforms.ToTensor())
+        test_ds = CIFAR10("./data", train=False, download=True, transform=transforms.ToTensor())
+    if args.dataset == "CIFAR100":
+        train_ds = CIFAR100("./data", train=True, download=True, transform=transforms.ToTensor())
+        test_ds = CIFAR100("./data", train=False, download=True, transform=transforms.ToTensor())
+
+    # train_ds = (MNIST if args.dataset=="MNIST" else CIFAR10)("./data", train=True, download=True, transform=transforms.ToTensor())
+    # test_ds  = (MNIST if args.dataset=="MNIST" else CIFAR10)("./data", train=False, download=True, transform=transforms.ToTensor())
     in_ch = train_ds[0][0].shape[0]
     H, W = train_ds[0][0].shape[1:]
     model = UNetAutoencoder(in_ch, args.base_ch, args.latent_dim, H, W).to(dev)
@@ -185,6 +201,8 @@ def main():
     print(f"Model parameters: {num_params:,} ({num_params/1e6:.2f}M)")
     print(f"Approximate model size: {size_kb:.2f} KB")
     num_classes = len(np.unique(np.array(train_ds.targets)))
+    print(f"\n--- Pre-Training Eval ---")
+    evaluate_ssim_no_hdc(model, test_ds, num_classes, args.num_samples, args.out_dir, dev)
     for c in range(num_classes):
         print(f"\n=== Training on class {c} ===")
         idxs = np.where(np.array(train_ds.targets)==c)[0]

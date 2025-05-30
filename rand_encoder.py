@@ -138,33 +138,23 @@ def train_decoder_without_hdc(model, loader, epochs, lr, dev):
             zc = model.encode(x)
             dec = model.decode(zc)
             loss = criterion(dec, x)
-            loss.backward(); 
+            loss.backward()
             opt.step()
 
-def evaluate_ssim_no_hdc(model, dataset, num_classes, num_samples, out_dir, dev):
+def evaluate_ssim_no_hdc(model, test_loaders, num_classes, num_samples, out_dir, dev):
     model.eval()
     per_class_ssim = {}
     for cls in range(num_classes):
-        imgs = []
-        for x, y in dataset:
-            if y == cls:
-                imgs.append(x)
-                if len(imgs) >= num_samples:
-                    break
-        batch = torch.stack(imgs).to(dev)
-        with torch.no_grad():
-            z = model.encode(batch)
-            dec = model.decode(z)
-        s = ssim_func(batch, dec, data_range=1.0, size_average=True).item()
-        per_class_ssim[cls] = s
-        print(f"Class {cls}: SSIM = {s:.4f}")
-        orig = batch.cpu().numpy(); recon = dec.cpu().numpy()
-        fig, ax = plt.subplots(2, num_samples, figsize=(2*num_samples, 4))
-        for i in range(num_samples):
-            ax[0,i].imshow(orig[i].transpose(1,2,0), cmap='gray' if orig.shape[1]==1 else None); ax[0,i].axis('off')
-            ax[1,i].imshow(recon[i].transpose(1,2,0), cmap='gray' if recon.shape[1]==1 else None); ax[1,i].axis('off')
-        ax[0,0].set_title('Orig'); ax[1,0].set_title('Recon')
-        plt.tight_layout(); plt.savefig(f"{out_dir}img/recon_class_{cls}.png", dpi=150); plt.close(fig)
+        loader = test_loaders[cls]
+        s, i = 0, 0
+        for x, y in loader:
+            with torch.no_grad():
+                z = model.encode(x)
+                dec = model.decode(z)
+                s = s + ssim_func(x, dec, data_range=1.0, size_average=True).item()
+                i = i + 1
+        per_class_ssim[cls] = s / 
+        print(f"Class {cls}: SSIM = {per_class_ssim[cls]:.4f}")
     mean_ssim = sum(per_class_ssim.values()) / len(per_class_ssim)
     print(f"Mean SSIM: {mean_ssim:.4f}")
     return per_class_ssim
@@ -174,13 +164,14 @@ def main():
     parser.add_argument("--dataset", choices=["MNIST","CIFAR10", "CIFAR100"], default="CIFAR10")
     parser.add_argument("--latent_dim", type=int, default=256)
     parser.add_argument("--base_ch", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--out_dir", type=str, default="./")
     args = parser.parse_args()
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(dev)
     if args.dataset == "MNIST":
         train_ds = MNIST("./data", train=True, download=True, transform=transforms.ToTensor())
         test_ds = MNIST("./data", train=False, download=True, transform=transforms.ToTensor())
@@ -191,8 +182,6 @@ def main():
         train_ds = CIFAR100("./data", train=True, download=True, transform=transforms.ToTensor())
         test_ds = CIFAR100("./data", train=False, download=True, transform=transforms.ToTensor())
 
-    # train_ds = (MNIST if args.dataset=="MNIST" else CIFAR10)("./data", train=True, download=True, transform=transforms.ToTensor())
-    # test_ds  = (MNIST if args.dataset=="MNIST" else CIFAR10)("./data", train=False, download=True, transform=transforms.ToTensor())
     in_ch = train_ds[0][0].shape[0]
     H, W = train_ds[0][0].shape[1:]
     model = UNetAutoencoder(in_ch, args.base_ch, args.latent_dim, H, W).to(dev)
@@ -201,18 +190,20 @@ def main():
     print(f"Model parameters: {num_params:,} ({num_params/1e6:.2f}M)")
     print(f"Approximate model size: {size_kb:.2f} KB")
     num_classes = len(np.unique(np.array(train_ds.targets)))
+    test_loaders = []
+    for i in range(num_classes):
+        idxs = np.where(np.array(test_ds.targets)==i)[0]
+        loader = DataLoader(Subset(test_ds, idxs), batch_size=args.batch_size, shuffle=True, num_workers=4)
+        test_loaders.append(loader)
     print(f"\n--- Pre-Training Eval ---")
-    evaluate_ssim_no_hdc(model, test_ds, num_classes, args.num_samples, args.out_dir, dev)
+    evaluate_ssim_no_hdc(model, test_loaders, num_classes, args.num_samples, args.out_dir, dev)
     for c in range(num_classes):
         print(f"\n=== Training on class {c} ===")
         idxs = np.where(np.array(train_ds.targets)==c)[0]
         loader_c = DataLoader(Subset(train_ds, idxs), batch_size=args.batch_size, shuffle=True, num_workers=4)
         train_decoder_without_hdc(model, loader_c, args.epochs, args.lr, dev)
-        with torch.no_grad():
-            w = model.encoders[0].conv[0].weight.data.cpu().flatten()
-            print(f"Enc weights[:5] after class {c}: {w[:5].tolist()}")
         print(f"\n--- Eval after class {c} ---")
-        evaluate_ssim_no_hdc(model, test_ds, num_classes, args.num_samples, args.out_dir, dev)
+        evaluate_ssim_no_hdc(model, test_loaders, num_classes, args.num_samples, args.out_dir, dev)
 
 if __name__ == "__main__":
     main()

@@ -373,7 +373,7 @@ def main():
         if args.create_buffer:
             create_buffer(model, args.dataset,
                           args.latent_dim, device,
-                          per_class=50,
+                          per_class=100,
                           output_file="replay_buffer.pkl")
         else:
             print("→ Running integration pipeline …")

@@ -153,7 +153,7 @@ def evaluate_ssim_no_hdc(model, test_loaders, num_classes, num_samples, out_dir,
                 dec = model.decode(z)
                 s = s + ssim_func(x, dec, data_range=1.0, size_average=True).item()
                 i = i + 1
-        per_class_ssim[cls] = s / 
+        per_class_ssim[cls] = s / (i if i > 0 else 1)
         print(f"Class {cls}: SSIM = {per_class_ssim[cls]:.4f}")
     mean_ssim = sum(per_class_ssim.values()) / len(per_class_ssim)
     print(f"Mean SSIM: {mean_ssim:.4f}")

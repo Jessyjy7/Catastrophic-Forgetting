@@ -113,10 +113,6 @@ class UNetAutoencoder(nn.Module):
 
 
 def train_decoder_without_hdc(model, loader, epochs, lr, dev):
-    """
-    Freeze encoder + to_latent, train only the decoder on (x -> decode(encode(x))) with MSE.
-    Used only for the first class (c = 0).
-    """
     for p in model.encoders.parameters(): p.requires_grad = False
     for p in model.bottleneck.parameters(): p.requires_grad = False
     for p in model.to_latent.parameters(): p.requires_grad = False
@@ -140,11 +136,6 @@ def train_decoder_without_hdc(model, loader, epochs, lr, dev):
             opt.step()
 
 def train_decoder_on_latents(model, latent_loader, epochs, lr, dev):
-    """
-    Freeze everything except the decoder side (from_latent + decoders + final_conv),
-    then train on a DataLoader of (z_batch, x_batch) pairs using MSE(decode(z), x).
-    Used for incremental classes c >= 1.
-    """
     for p in model.encoders.parameters(): p.requires_grad = False
     for p in model.bottleneck.parameters(): p.requires_grad = False
     for p in model.to_latent.parameters(): p.requires_grad = False
@@ -187,10 +178,6 @@ def evaluate_ssim_no_hdc(model, test_loaders, num_classes, num_samples, out_dir,
     return per_class_ssim
 
 def prepare_buffer_for_class(model, loader_c, buffer_size, dev):
-    """
-    Run each batch in loader_c through the *frozen* encoder to get (z, x) pairs.
-    Collect up to `buffer_size` pairs, all moved to CPU.  Return as a list.
-    """
     buffer_list = []
     count = 0
     with torch.no_grad():
@@ -206,60 +193,37 @@ def prepare_buffer_for_class(model, loader_c, buffer_size, dev):
                     break
             if count >= buffer_size:
                 break
-    return buffer_list  # length == buffer_size (or fewer if dataset smaller)
+    return buffer_list  
 
 def train_class0(model, loader_c, epochs, lr, buffer_size, dev):
-    """
-    1) Train the decoder on class 0 (frozen encoder) using train_decoder_without_hdc().
-    2) Build & return replay_buffer[0] = up to buffer_size pairs (z, x) from class 0.
-    """
-    # Train decoder on class 0
     train_decoder_without_hdc(model, loader_c, epochs, lr, dev)
 
-    # Build buffer for class 0
     buffer0 = prepare_buffer_for_class(model, loader_c, buffer_size, dev)
     return buffer0
 
 def train_incremental_class(model, c, loader_c, replay_buffer, args, dev):
-    """
-    For class c >= 1:
-      a) Deep‐copy main model → delta_model
-      b) Freeze delta_model’s encoder + to_latent
-      c) Build combined (z, x) list = old class buffers + new class’s buffer_size examples
-      d) Train only delta_model’s decoder on that combined list via train_decoder_on_latents()
-      e) Copy decoder weights from delta_model → main model
-      f) Build & return replay_buffer[c] = up to buffer_size pairs (z, x) for class c
-    """
-    # Deep‐copy
     delta_model = copy.deepcopy(model)
 
-    # Freeze encoder + to_latent in delta_model
     for p in delta_model.encoders.parameters(): p.requires_grad = False
     for p in delta_model.bottleneck.parameters(): p.requires_grad = False
     for p in delta_model.to_latent.parameters(): p.requires_grad = False
 
-    # Collect all old (z, x) from replay_buffer[0..c−1]
     latent_list = []
     for old_cls in range(c):
         latent_list.extend(replay_buffer[old_cls])
 
-    # Collect up to buffer_size new (z, x) from class c
     new_list = prepare_buffer_for_class(model, loader_c, args.buffer_size, dev)
     latent_list.extend(new_list)
 
-    # Save new_list into replay_buffer[c]
     replay_buffer[c] = new_list
 
-    # Build a DataLoader over stacked tensors
-    all_z = torch.stack([pair[0] for pair in latent_list])  # shape: (N_total, latent_dim)
-    all_x = torch.stack([pair[1] for pair in latent_list])  # shape: (N_total, in_ch, H, W)
+    all_z = torch.stack([pair[0] for pair in latent_list])  
+    all_x = torch.stack([pair[1] for pair in latent_list])  
     latent_ds = TensorDataset(all_z, all_x)
     latent_loader = DataLoader(latent_ds, batch_size=args.batch_size, shuffle=True)
 
-    # Train only the decoder of delta_model
     train_decoder_on_latents(delta_model, latent_loader, args.epochs, args.lr, dev)
 
-    # Copy decoder weights back into main model
     dec_dict = {
         k: v
         for k, v in delta_model.state_dict().items()
@@ -267,7 +231,6 @@ def train_incremental_class(model, c, loader_c, replay_buffer, args, dev):
     }
     model.load_state_dict(dec_dict, strict=False)
 
-    # Return the new buffer for class c
     return new_list
 
 def main():
@@ -323,13 +286,11 @@ def main():
     print("\n--- Pre‐Training Eval (SSIM before any decoder training) ---")
     evaluate_ssim_no_hdc(model, test_loaders, num_classes, args.num_samples, args.out_dir, dev)
 
-    # replay_buffer[c] will be a list of up to buffer_size (z, x) pairs for class c
     replay_buffer = {}
 
     for c in range(num_classes):
         print(f"\n=== Training on class {c} ===")
 
-        # Build a DataLoader for the training samples of class c
         idxs_c = np.where(np.array(train_ds.targets) == c)[0]
         loader_c = DataLoader(
             Subset(train_ds, idxs_c),
@@ -339,7 +300,6 @@ def main():
         )
 
         if c == 0:
-            # Train decoder on class 0 and fill replay_buffer[0]
             replay_buffer[0] = train_class0(
                 model, loader_c,
                 epochs  = args.epochs,
@@ -348,7 +308,6 @@ def main():
                 dev     = dev
             )
         else:
-            # Incrementally train on class c using old buffers
             replay_buffer[c] = train_incremental_class(
                 model, c, loader_c, replay_buffer, args, dev
             )

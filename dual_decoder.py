@@ -10,6 +10,38 @@ from torch.utils.data import DataLoader, Subset, TensorDataset
 import torch.nn.functional as F
 from pytorch_msssim import ssim as ssim_func
 
+class SimpleAutoencoder(nn.Module):
+    def __init__(self):
+        super(SimpleAutoencoder, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(True)
+        )
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(32,  3, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.Sigmoid()
+        )
+
+    def encode(self, x):
+        z = self.encoder(x)
+        return z
+
+    def decode(self, z):
+        x_hat = self.decoder(z)
+        return x_hat
+
+    def forward(self, x):
+        z = self.encode(x)
+        return self.decode(z)
+
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -59,68 +91,10 @@ class DecoderBlock(nn.Module):
         x = self.att(x)
         return F.relu(self.conv(x))
 
-class UNetAutoencoder(nn.Module):
-    def __init__(self, in_ch, base_ch, latent_dim, height, width):
-        super().__init__()
-        levels = 0
-        h, w = height, width
-        while h >= 8 and w >= 8:
-            h //= 2; w //= 2; levels += 1
-        self.levels = levels
-
-        self.encoders = nn.ModuleList()
-        ch = base_ch; in_c = in_ch
-        for _ in range(levels):
-            self.encoders.append(EncoderBlock(in_c, ch))
-            in_c = ch; ch *= 2
-
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(in_c, in_c, 3, padding=1),
-            nn.BatchNorm2d(in_c),
-            nn.ReLU(inplace=True),
-            ResidualBlock(in_c)
-        )
-
-        self.flat_h, self.flat_w = h, w
-        flat_ch = in_c * h * w
-        self.to_latent   = nn.Linear(flat_ch, latent_dim)
-        self.from_latent = nn.Linear(latent_dim, flat_ch)
-
-        self.decoders = nn.ModuleList()
-        ch //= 2
-        for _ in range(levels):
-            self.decoders.append(DecoderBlock(in_c, ch))
-            in_c = ch; ch //= 2
-        self.final_conv = nn.Conv2d(in_c, in_ch, 1)
-
-    def encode(self, x):
-        out = x
-        for enc in self.encoders:
-            out = enc(out)
-        out = self.bottleneck(out)
-        B, C, H, W = out.shape
-        flat = out.view(B, -1)
-        z    = self.to_latent(flat)
-        return z
-
-    def decode(self, z):
-        B = z.size(0)
-        flat = self.from_latent(z)
-        out  = flat.view(B, -1, self.flat_h, self.flat_w)
-        for dec in self.decoders:
-            out = dec(out)
-        return torch.sigmoid(self.final_conv(out))
-
-
 def train_decoder_without_hdc(model, loader, epochs, lr, dev):
-    for p in model.encoders.parameters(): p.requires_grad = False
-    for p in model.bottleneck.parameters(): p.requires_grad = False
-    for p in model.to_latent.parameters(): p.requires_grad = False
-
+    for p in model.encoder.parameters(): p.requires_grad = False
     opt = optim.Adam(
-        list(model.from_latent.parameters()) +
-        list(model.decoders.parameters()) +
-        list(model.final_conv.parameters()),
+        list(model.decoder.parameters()),
         lr=lr
     )
     criterion = nn.MSELoss()
@@ -136,14 +110,9 @@ def train_decoder_without_hdc(model, loader, epochs, lr, dev):
             opt.step()
 
 def train_decoder_on_latents(model, latent_loader, epochs, lr, dev):
-    for p in model.encoders.parameters(): p.requires_grad = False
-    for p in model.bottleneck.parameters(): p.requires_grad = False
-    for p in model.to_latent.parameters(): p.requires_grad = False
-
+    for p in model.encoder.parameters(): p.requires_grad = False
     opt = optim.Adam(
-        list(model.from_latent.parameters()) +
-        list(model.decoders.parameters()) +
-        list(model.final_conv.parameters()),
+        list(model.decoder.parameters()),
         lr=lr
     )
     criterion = nn.MSELoss()
@@ -197,47 +166,36 @@ def prepare_buffer_for_class(model, loader_c, buffer_size, dev):
 
 def train_class0(model, loader_c, epochs, lr, buffer_size, dev):
     train_decoder_without_hdc(model, loader_c, epochs, lr, dev)
-
     buffer0 = prepare_buffer_for_class(model, loader_c, buffer_size, dev)
     return buffer0
 
 def train_incremental_class(model, c, loader_c, replay_buffer, args, dev):
     delta_model = copy.deepcopy(model)
-
-    for p in delta_model.encoders.parameters(): p.requires_grad = False
-    for p in delta_model.bottleneck.parameters(): p.requires_grad = False
-    for p in delta_model.to_latent.parameters(): p.requires_grad = False
-
+    for p in delta_model.encoder.parameters(): p.requires_grad = False
     latent_list = []
     for old_cls in range(c):
         latent_list.extend(replay_buffer[old_cls])
-
     new_list = prepare_buffer_for_class(model, loader_c, args.buffer_size, dev)
     latent_list.extend(new_list)
-
     replay_buffer[c] = new_list
-
-    all_z = torch.stack([pair[0] for pair in latent_list])  
-    all_x = torch.stack([pair[1] for pair in latent_list])  
+    all_z = torch.stack([pair[0] for pair in latent_list])
+    all_x = torch.stack([pair[1] for pair in latent_list])
     latent_ds = TensorDataset(all_z, all_x)
     latent_loader = DataLoader(latent_ds, batch_size=args.batch_size, shuffle=True)
-
     train_decoder_on_latents(delta_model, latent_loader, args.epochs, args.lr, dev)
-
     dec_dict = {
         k: v
         for k, v in delta_model.state_dict().items()
-        if k.startswith("from_latent") or k.startswith("decoders") or k.startswith("final_conv")
+        if k.startswith("decoder")
     }
     model.load_state_dict(dec_dict, strict=False)
-
     return new_list
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["MNIST","CIFAR10", "CIFAR100"], default="CIFAR10")
-    parser.add_argument("--latent_dim", type=int, default=256)
-    parser.add_argument("--base_ch", type=int, default=16)
+    parser.add_argument("--latent_dim", type=int, default=256, help="(ignored)")
+    parser.add_argument("--base_ch", type=int, default=16, help="(ignored)")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -246,13 +204,13 @@ def main():
     parser.add_argument("--buffer_size", type=int, default=100,
                         help="How many (z,x) pairs to store per class in the replay buffer")
     args = parser.parse_args()
-
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", dev)
-
     if args.dataset == "MNIST":
         train_ds = MNIST("./data", train=True,  download=True, transform=transforms.ToTensor())
         test_ds  = MNIST("./data", train=False, download=True, transform=transforms.ToTensor())
+        in_ch, H, W = 1, 28, 28
+        raise ValueError("SimpleAutoencoder is built for 3×32×32 (CIFAR). Use CIFAR10 or CIFAR100.")
     elif args.dataset == "CIFAR10":
         train_ds = CIFAR10("./data", train=True,  download=True, transform=transforms.ToTensor())
         test_ds  = CIFAR10("./data", train=False, download=True, transform=transforms.ToTensor())
@@ -261,16 +219,11 @@ def main():
         test_ds  = CIFAR100("./data", train=False, download=True, transform=transforms.ToTensor())
     else:
         raise ValueError("Unsupported dataset")
-
-    in_ch = train_ds[0][0].shape[0]
-    H, W = train_ds[0][0].shape[1:]
-    model = UNetAutoencoder(in_ch, args.base_ch, args.latent_dim, H, W).to(dev)
-
+    model = SimpleAutoencoder().to(dev)
     num_params = sum(p.numel() for p in model.parameters())
     size_kb = num_params * 4 / 1024
     print(f"Model parameters: {num_params:,} ({num_params/1e6:.2f}M)")
     print(f"Approximate model size: {size_kb:.2f} KB")
-
     num_classes = len(np.unique(np.array(train_ds.targets)))
     test_loaders = []
     for i in range(num_classes):
@@ -282,15 +235,11 @@ def main():
             num_workers=4
         )
         test_loaders.append(loader)
-
     print("\n--- Pre‐Training Eval (SSIM before any decoder training) ---")
     evaluate_ssim_no_hdc(model, test_loaders, num_classes, args.num_samples, args.out_dir, dev)
-
     replay_buffer = {}
-
     for c in range(num_classes):
         print(f"\n=== Training on class {c} ===")
-
         idxs_c = np.where(np.array(train_ds.targets) == c)[0]
         loader_c = DataLoader(
             Subset(train_ds, idxs_c),
@@ -298,25 +247,21 @@ def main():
             shuffle=True,
             num_workers=4
         )
-
         if c == 0:
             replay_buffer[0] = train_class0(
                 model, loader_c,
-                epochs  = args.epochs,
-                lr      = args.lr,
+                epochs      = args.epochs,
+                lr          = args.lr,
                 buffer_size = args.buffer_size,
-                dev     = dev
+                dev         = dev
             )
         else:
             replay_buffer[c] = train_incremental_class(
                 model, c, loader_c, replay_buffer, args, dev
             )
-
         print(f"\n--- Eval after class {c} ---")
         evaluate_ssim_no_hdc(model, test_loaders, num_classes, args.num_samples, args.out_dir, dev)
-
     print("\n=== Finished all classes! ===")
-
 
 if __name__ == "__main__":
     main()
